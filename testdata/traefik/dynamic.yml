@@ -1,0 +1,57 @@
+# Dynamic fixtures for integration tests.
+http:
+  routers:
+    whoami:
+      rule: Host(`whoami.test`)
+      entryPoints: [web]
+      middlewares: [headers]
+      service: whoami
+    whoami-secure:
+      rule: Host(`whoami.test`) && PathPrefix(`/secure`)
+      entryPoints: [web]
+      middlewares: [headers, auth]
+      service: whoami
+    broken:
+      rule: Host(`broken.test`)
+      entryPoints: [web]
+      service: does-not-exist
+  services:
+    whoami:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:1
+  middlewares:
+    headers:
+      headers:
+        customResponseHeaders:
+          X-Test: "1"
+    auth:
+      basicAuth:
+        users:
+          - "test:$apr1$H6uskkkW$IgXLP6ewTrSuBkTrqE8wj/"
+tcp:
+  routers:
+    pg:
+      rule: HostSNI(`*`)
+      entryPoints: [tcp]
+      middlewares: [allowlist]
+      service: pg
+  services:
+    pg:
+      loadBalancer:
+        servers:
+          - address: 127.0.0.1:5432
+  middlewares:
+    allowlist:
+      ipAllowList:
+        sourceRange: [127.0.0.1/32]
+udp:
+  routers:
+    dns:
+      entryPoints: [udp]
+      service: dns
+  services:
+    dns:
+      loadBalancer:
+        servers:
+          - address: 127.0.0.1:53

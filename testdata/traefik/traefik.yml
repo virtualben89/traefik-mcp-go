@@ -1,0 +1,19 @@
+# Static configuration for integration tests (CI and local).
+# API on :8080 (insecure, test only), file provider with fixtures in dynamic.yml.
+entryPoints:
+  traefik:
+    address: ":8080"
+  web:
+    address: ":8000"
+  tcp:
+    address: ":9000"
+  udp:
+    address: ":9001/udp"
+api:
+  insecure: true
+  dashboard: false
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+log:
+  level: WARN

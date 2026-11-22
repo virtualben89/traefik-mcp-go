@@ -1,0 +1,38 @@
+# Example: traefik-mcp for two Traefik instances, published via Traefik itself.
+# Create the token first:  openssl rand -hex 32 > mcp_token.txt && chmod 644 mcp_token.txt
+# (the container runs as UID 65532 and must be able to read it)
+services:
+  traefik-mcp:
+    image: ghcr.io/virtualben89/traefik-mcp-go:latest
+    container_name: traefik-mcp
+    restart: unless-stopped
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    environment:
+      MCP_TRANSPORT: http
+      MCP_AUTH_TOKEN_FILE: /run/secrets/mcp_token
+      TRAEFIK_INSTANCES: edge,lan
+      TRAEFIK_DEFAULT_INSTANCE: edge
+      # Public Traefik with Basic Auth on the API router
+      TRAEFIK_EDGE_URL: https://traefik.example.com
+      TRAEFIK_EDGE_BASIC_USER: mcp
+      TRAEFIK_EDGE_BASIC_PASSWORD: ${TRAEFIK_EDGE_PASSWORD:?}
+      # Internal Traefik, API reachable on the docker network
+      TRAEFIK_LAN_URL: http://traefik:8080
+    secrets: [mcp_token]
+    networks: [proxy]
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.traefik-mcp.rule: Host(`traefik-mcp.example.com`)
+      traefik.http.routers.traefik-mcp.entrypoints: websecure
+      traefik.http.routers.traefik-mcp.tls.certresolver: letsencrypt
+      traefik.http.services.traefik-mcp.loadbalancer.server.port: "8080"
+
+secrets:
+  mcp_token:
+    file: ./mcp_token.txt
+
+networks:
+  proxy:
+    external: true
