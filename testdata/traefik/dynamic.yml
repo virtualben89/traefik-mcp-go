@@ -15,11 +15,34 @@ http:
       rule: Host(`broken.test`)
       entryPoints: [web]
       service: does-not-exist
+    # looks like the Docker default rule (missing rule label)
+    ghost:
+      rule: Host(`ghost-project`)
+      entryPoints: [web]
+      service: whoami
+    secure:
+      rule: Host(`secure.test`)
+      entryPoints: [websecure]
+      service: down
+      tls: {}
+    secure-api:
+      rule: Host(`secure.test`) && PathPrefix(`/api`)
+      entryPoints: [websecure]
+      service: whoami
+      tls: {}
   services:
     whoami:
       loadBalancer:
         servers:
           - url: http://127.0.0.1:1
+    down:
+      loadBalancer:
+        healthCheck:
+          path: /
+          interval: 1s
+          timeout: 500ms
+        servers:
+          - url: http://127.0.0.1:2
   middlewares:
     headers:
       headers:
