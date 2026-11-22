@@ -57,8 +57,10 @@ type Config struct {
 	AllowNoAuth        bool
 
 	// Behaviour
-	ToolPrefix     string
-	DefaultPerPage int
+	ToolPrefix      string
+	DefaultPerPage  int
+	CertWarnDays    int
+	TLSCheckEnabled bool
 
 	LogLevel  string
 	LogFormat string
@@ -233,6 +235,8 @@ func Load(args []string) (*Config, error) {
 
 	fs.StringVar(&c.ToolPrefix, "tool-prefix", envOr("TOOL_PREFIX", ""), "Optional prefix for all tool names, e.g. traefik_ (env TOOL_PREFIX)")
 	perPage := fs.String("default-per-page", envOr("DEFAULT_PER_PAGE", "100"), "Default page size for list tools (env DEFAULT_PER_PAGE)")
+	warnDays := fs.String("cert-warn-days", envOr("CERT_WARN_DAYS", "21"), "health_report warns about certificates expiring within this many days (env CERT_WARN_DAYS)")
+	fs.BoolVar(&c.TLSCheckEnabled, "tls-check", mustBool("TLS_CHECK_ENABLED", true), "Expose check_tls_endpoint, which connects to arbitrary hosts (env TLS_CHECK_ENABLED)")
 
 	fs.StringVar(&c.LogLevel, "log-level", envOr("LOG_LEVEL", "info"), "debug, info, warn, error (env LOG_LEVEL)")
 	fs.StringVar(&c.LogFormat, "log-format", envOr("LOG_FORMAT", "text"), "text or json (env LOG_FORMAT)")
@@ -250,6 +254,9 @@ func Load(args []string) (*Config, error) {
 	}
 	if c.DefaultPerPage, err = strconv.Atoi(*perPage); err != nil || c.DefaultPerPage <= 0 {
 		return nil, fmt.Errorf("invalid DEFAULT_PER_PAGE %q", *perPage)
+	}
+	if c.CertWarnDays, err = strconv.Atoi(*warnDays); err != nil || c.CertWarnDays <= 0 {
+		return nil, fmt.Errorf("invalid CERT_WARN_DAYS %q", *warnDays)
 	}
 	defInsecure, err := envBool("TRAEFIK_INSECURE_SKIP_VERIFY", false)
 	if err != nil {

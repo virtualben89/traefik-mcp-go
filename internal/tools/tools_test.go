@@ -143,7 +143,7 @@ func TestSchemasPortable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Tools) != 7 {
+	if len(res.Tools) != 14 {
 		t.Fatalf("got %d tools", len(res.Tools))
 	}
 	for _, tool := range res.Tools {

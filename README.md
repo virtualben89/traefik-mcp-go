@@ -2,26 +2,37 @@
 
 A small, read-only [Model Context Protocol](https://modelcontextprotocol.io) server for the [Traefik](https://traefik.io) API, written in Go.
 
-- **Read-only**: routers, services and middlewares for HTTP, TCP and UDP, list and detail views
+- **Read-only**: entry points, routers, services, middlewares (HTTP, TCP, UDP) and certificates
+- **Troubleshooting tools**: one-call `health_report`, `find_route` (which router handles a URL, full chain to the backend) and `check_tls_endpoint` (certificate actually served)
 - **Several Traefik instances** in one server (`instance` parameter on every tool)
 - **Transports**: stdio, Streamable HTTP (`/mcp`) and legacy HTTP+SSE (`/sse`)
 - **Bearer token auth** for the HTTP transports (several tokens possible, for rotation)
 - **Upstream auth** towards Traefik: Basic Auth, Bearer token or custom headers (e.g. ForwardAuth / Cloudflare Access)
 - **Small image**: static binary on `scratch`, about 10 MB, multi-arch (amd64, arm64, arm/v7)
 - Portable tool schemas (no `$ref`, no type arrays), so it works with Claude, ChatGPT/OpenAI, Gemini, Cursor, VS Code, Codex, Hermes and other MCP clients
-- Tested against Traefik v3.7 and v2.11
+- Tested against Traefik v3.7 and v2.11 (`list_certificates` needs v3.7+)
 
 ## Tools
+
+**Inventory**
 
 | Tool | Purpose |
 |---|---|
 | `list_instances` | Configured instances, reachability and Traefik version |
-| `list_routers` | Routers (`protocol` http/tcp/udp), filter by `search`, `status`, `service`, `middleware`; paginated |
-| `get_router` | Router details: rule, entryPoints, middlewares, service, TLS/certResolver, errors |
-| `list_services` | Services with servers, `serverStatus` (UP/DOWN) and `usedBy` |
-| `get_service` | Service details |
-| `list_middlewares` | Middlewares (http/tcp) with type, config and `usedBy` |
-| `get_middleware` | Middleware details |
+| `get_overview` | Counts of routers/services/middlewares per protocol incl. warnings/errors, providers, features |
+| `list_entrypoints` / `get_entrypoint` | Address, port, protocol, HTTP→HTTPS redirect, default TLS, entry point middlewares, forwardedHeaders, proxyProtocol |
+| `list_routers` / `get_router` | Routers (`protocol` http/tcp/udp), filter by `search`, `status`, `service`, `middleware`; paginated |
+| `list_services` / `get_service` | Services with servers, `serverStatus` (UP/DOWN) and `usedBy` |
+| `list_middlewares` / `get_middleware` | Middlewares (http/tcp) with type, config and `usedBy` |
+| `list_certificates` | Certificates with SANs, issuer, expiry and `days_left`, sorted by expiry; filter by domain or `expiring_within_days` (Traefik 3.7+, metadata only) |
+
+**Troubleshooting**
+
+| Tool | Purpose |
+|---|---|
+| `health_report` | One call for one or all instances (`all_instances`). Findings sorted by severity: disabled routers/services/middlewares and warnings with Traefik's error text, backends DOWN (all or partially), expired/soon expiring certificates (`cert_warn_days`), ghost routers (Docker default rule `Host(<service>-<project>)` because a rule label is missing), routers served over plain HTTP without redirect (info) |
+| `find_route` | Which router handles `https://host/path`? Evaluates `Host`, `HostRegexp`, `Path`, `PathPrefix`, `PathRegexp`, `Method` and TCP `HostSNI`/`HostSNIRegexp` (v2 and v3 syntax) with router priorities. Returns the chain entry point → router → middlewares (entry point middlewares first) → service (incl. weighted/failover children) → servers with UP/DOWN. TCP routers (e.g. TLS passthrough) take precedence, entry point redirects are reported, matchers on headers/query/client IP are flagged as `unknown` |
+| `check_tls_endpoint` | TLS handshake against `host:port` (optional SNI): served certificate, chain and hostname verification, TLS version, ALPN, detection of `TRAEFIK DEFAULT CERT`, and whether the certificate is in a Traefik store |
 
 Notes:
 - Names carry a provider suffix (`whoami@docker`). `get_*` also accepts the bare name and resolves it when it is unique.
@@ -29,6 +40,7 @@ Notes:
 - If a list result contains `next_page`, call again with `page=<next_page>`.
 - `status` is one of `enabled`, `disabled`, `warning`. Disabled or warning objects carry an `error` list.
 - The `service` / `middleware` filters work on Traefik v2 too (filtered by the server, not by Traefik).
+- `find_route` works on the API data only; it never sends a request to the URL.
 
 ## Configuration
 
@@ -80,6 +92,8 @@ Every `*_PASSWORD`, `*_BEARER_TOKEN` and `*_HEADERS` variable also has a `_FILE`
 | `MCP_ALLOW_NO_AUTH` | `false` | Explicitly allow http without a token |
 | `TOOL_PREFIX` | – | Prefix for tool names, e.g. `traefik_` |
 | `DEFAULT_PER_PAGE` | `100` | Default page size |
+| `CERT_WARN_DAYS` | `21` | `health_report` warns about certificates expiring within this many days |
+| `TLS_CHECK_ENABLED` | `true` | Expose `check_tls_endpoint` (set `false` if the server must not open connections to arbitrary hosts) |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / `text` | Logs always go to stderr |
 
 HTTP endpoints: `/mcp` and `/sse` (protected), `/healthz` (liveness), `/readyz` (503 if any instance is unreachable; only reports instance names).
@@ -142,6 +156,7 @@ publish the API through a router on `api@internal` protected by Basic Auth, Forw
 ## Security
 
 - The Traefik API is read-only by design; this server exposes no write operations.
+- `check_tls_endpoint` is the only tool that connects somewhere other than the configured Traefik APIs (a TLS handshake, no HTTP request). Disable it with `TLS_CHECK_ENABLED=false` if needed.
 - `get_middleware` returns middleware configuration as Traefik exposes it. That can include Basic Auth user hashes.
 - Bearer tokens are compared in constant time (SHA-256 digests). Without `MCP_AUTH_TOKEN` the HTTP transport refuses to start unless `MCP_ALLOW_NO_AUTH=true`.
 - The container runs as UID 65532 on `scratch` (no shell).

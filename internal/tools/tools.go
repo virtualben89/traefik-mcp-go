@@ -2,6 +2,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,10 @@ type Options struct {
 	Default string
 	// Order is the configured instance order (names).
 	Order []string
+	// CertWarnDays is the default warning threshold for expiring certificates.
+	CertWarnDays int
+	// DisableTLSCheck removes the check_tls_endpoint tool (it connects to arbitrary hosts).
+	DisableTLSCheck bool
 }
 
 // Registry adds tools to a server.
@@ -47,6 +52,9 @@ type Registry struct {
 func Register(srv *mcp.Server, instances map[string]Instance, opts Options) []string {
 	if opts.DefaultPerPage <= 0 {
 		opts.DefaultPerPage = 100
+	}
+	if opts.CertWarnDays <= 0 {
+		opts.CertWarnDays = 21
 	}
 	if opts.Default == "" && len(opts.Order) > 0 {
 		opts.Default = opts.Order[0]
@@ -63,6 +71,7 @@ type toolDef struct {
 	title       string
 	description string
 	enums       map[string][]any // property name -> allowed values
+	openWorld   bool             // talks to systems beyond the configured Traefik APIs
 }
 
 // add registers a typed read-only tool.
@@ -92,7 +101,7 @@ func add[In any](r *Registry, d toolDef, h func(context.Context, In) (*mcp.CallT
 			Title:          d.title,
 			ReadOnlyHint:   true,
 			IdempotentHint: true,
-			OpenWorldHint:  ptr(false),
+			OpenWorldHint:  ptr(d.openWorld),
 		},
 	}
 	mcp.AddTool(r.srv, tool, func(ctx context.Context, _ *mcp.CallToolRequest, in In) (*mcp.CallToolResult, any, error) {
@@ -129,6 +138,13 @@ func sanitizeSchema(s *jsonschema.Schema) {
 	sanitizeSchema(s.Items)
 }
 
+// decodeExact decodes JSON keeping numbers exact (router priorities can be MaxInt64).
+func decodeExact(b []byte, v any) error {
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.UseNumber()
+	return d.Decode(v)
+}
+
 func errorResult(err error) *mcp.CallToolResult {
 	return &mcp.CallToolResult{
 		IsError: true,
@@ -136,12 +152,16 @@ func errorResult(err error) *mcp.CallToolResult {
 	}
 }
 
+// valueResult returns compact JSON without HTML escaping, so rules such as
+// Host(`a`) && Path(`/`) stay readable for the model.
 func valueResult(v any) (*mcp.CallToolResult, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
 		return nil, err
 	}
-	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(b)}}}, nil
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: strings.TrimRight(buf.String(), "\n")}}}, nil
 }
 
 // ---- inputs ----
@@ -321,7 +341,7 @@ func (r *Registry) list(ctx context.Context, k kind, p listParams) (*mcp.CallToo
 			}
 			return nil, err
 		}
-		if err := json.Unmarshal(resp.Body, &items); err != nil {
+		if err := decodeExact(resp.Body, &items); err != nil {
 			return nil, fmt.Errorf("decoding %s list: %w", k.path, err)
 		}
 		nextPage = resp.NextPage
@@ -362,7 +382,7 @@ func fetchAll(ctx context.Context, c *traefik.Client, path string, base url.Valu
 			return nil, err
 		}
 		var items []map[string]any
-		if err := json.Unmarshal(resp.Body, &items); err != nil {
+		if err := decodeExact(resp.Body, &items); err != nil {
 			return nil, fmt.Errorf("decoding %s: %w", path, err)
 		}
 		all = append(all, items...)
@@ -420,7 +440,7 @@ func resolveName(ctx context.Context, c *traefik.Client, proto string, k kind, n
 		var items []struct {
 			Name string `json:"name"`
 		}
-		if err := json.Unmarshal(resp.Body, &items); err != nil {
+		if err := decodeExact(resp.Body, &items); err != nil {
 			return "", err
 		}
 		for _, it := range items {
@@ -467,7 +487,7 @@ func (r *Registry) get(ctx context.Context, k kind, in GetInput) (*mcp.CallToolR
 		return nil, err
 	}
 	var obj map[string]any
-	if err := json.Unmarshal(resp.Body, &obj); err != nil {
+	if err := decodeExact(resp.Body, &obj); err != nil {
 		return nil, fmt.Errorf("decoding %s: %w", k.single, err)
 	}
 	return valueResult(map[string]any{"instance": iname, "protocol": proto, k.single: obj})
@@ -583,4 +603,67 @@ func (r *Registry) registerAll() {
 	}, func(ctx context.Context, in GetInput) (*mcp.CallToolResult, error) {
 		return r.get(ctx, kMiddlewares, in)
 	})
+
+	add(r, toolDef{
+		name:  "get_overview",
+		title: "Get overview",
+		description: "Summary of a Traefik instance: number of routers, services and middlewares per protocol with warning/error counts, " +
+			"certificate count, enabled providers and features, plus version. Good first call before drilling down.",
+		enums: map[string][]any{"instance": instEnum},
+	}, r.overview)
+
+	add(r, toolDef{
+		name:  "list_entrypoints",
+		title: "List entry points",
+		description: "List entry points with address, port, protocol, HTTP->HTTPS redirect, default TLS, entry point middlewares, " +
+			"forwardedHeaders and proxyProtocol settings. full=true returns the complete objects.",
+		enums: map[string][]any{"instance": instEnum},
+	}, r.listEntryPoints)
+
+	add(r, toolDef{
+		name:        "get_entrypoint",
+		title:       "Get entry point",
+		description: "Get the complete configuration of one entry point (transport timeouts, HTTP/2/3, redirects, TLS, middlewares).",
+		enums:       map[string][]any{"instance": instEnum},
+	}, r.getEntryPoint)
+
+	add(r, toolDef{
+		name:  "list_certificates",
+		title: "List certificates",
+		description: "List TLS certificates known to Traefik (ACME and file provider) with SANs, issuer, validity and days_left, " +
+			"sorted by expiry. Filter by domain (search) or expiring_within_days. Metadata only, never private keys. Requires Traefik v3.7+.",
+		enums: map[string][]any{"instance": instEnum},
+	}, r.listCertificates)
+
+	add(r, toolDef{
+		name:  "health_report",
+		title: "Health report",
+		description: "One-call health check of a Traefik instance (or all with all_instances): disabled routers/services/middlewares " +
+			"and warnings with their error messages, backends DOWN, expired or soon expiring certificates, ghost routers " +
+			"(Docker default rule because a rule label is missing) and routers served over plain HTTP without redirect (info). " +
+			"Findings are sorted by severity (error, warning, info).",
+		enums: map[string][]any{"instance": instEnum},
+	}, r.healthReport)
+
+	add(r, toolDef{
+		name:  "find_route",
+		title: "Find route for URL",
+		description: "Determine which router would handle a URL and show the full chain: entry point -> router -> middlewares -> service -> " +
+			"backend servers with UP/DOWN status. Evaluates Host, HostRegexp, Path, PathPrefix, PathRegexp, Method and TCP HostSNI rules with " +
+			"router priorities; TCP routers (e.g. TLS passthrough) take precedence. Conditions on headers, query or client IP are reported as " +
+			"'unknown'. The entry point is derived from the URL port unless given.",
+		enums: map[string][]any{"instance": instEnum},
+	}, r.findRoute)
+
+	if !r.opts.DisableTLSCheck {
+		add(r, toolDef{
+			name:  "check_tls_endpoint",
+			title: "Check TLS endpoint",
+			description: "Connect to host:port, perform a TLS handshake and report the certificate actually served (subject, SANs, issuer, " +
+				"validity, days_left, fingerprint), chain/hostname verification, TLS version and ALPN. Detects Traefik's self-signed default " +
+				"certificate and whether the certificate is in a Traefik instance's store.",
+			enums:     map[string][]any{"instance": instEnum},
+			openWorld: true,
+		}, r.checkTLS)
+	}
 }

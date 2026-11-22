@@ -5,6 +5,15 @@ entryPoints:
     address: ":8080"
   web:
     address: ":8000"
+  websecure:
+    address: ":8443"
+  redir:
+    address: ":8001"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
   tcp:
     address: ":9000"
   udp:

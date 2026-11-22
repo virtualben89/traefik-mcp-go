@@ -123,7 +123,7 @@ func TestHTTPAuth(t *testing.T) {
 			t.Fatalf("%s: connect: %v", tc.path, err)
 		}
 		res, err := cs.ListTools(ctx, nil)
-		if err != nil || len(res.Tools) != 7 {
+		if err != nil || len(res.Tools) != 14 {
 			t.Fatalf("%s: list tools: %v", tc.path, err)
 		}
 		cr, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "list_routers", Arguments: map[string]any{}})

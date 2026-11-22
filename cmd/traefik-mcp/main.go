@@ -128,10 +128,12 @@ func run() error {
 		return err
 	}
 	toolOpts := tools.Options{
-		Prefix:         cfg.ToolPrefix,
-		DefaultPerPage: cfg.DefaultPerPage,
-		Default:        cfg.DefaultInstance,
-		Order:          cfg.InstanceNames(),
+		Prefix:          cfg.ToolPrefix,
+		DefaultPerPage:  cfg.DefaultPerPage,
+		Default:         cfg.DefaultInstance,
+		Order:           cfg.InstanceNames(),
+		CertWarnDays:    cfg.CertWarnDays,
+		DisableTLSCheck: !cfg.TLSCheckEnabled,
 	}
 	server, names := NewServer(instances, toolOpts, log)
 	log.Info("traefik-mcp starting", "version", version, "transport", cfg.Transport,
@@ -166,8 +168,10 @@ func NewServer(instances map[string]tools.Instance, opts tools.Options, log *slo
 		Title:   "Traefik",
 		Version: version,
 	}, &mcp.ServerOptions{
-		Instructions: "Read-only access to the Traefik reverse proxy API (routers, services, middlewares for HTTP, TCP and UDP). " +
+		Instructions: "Read-only access to the Traefik reverse proxy API (entry points, routers, services, middlewares for HTTP, TCP and UDP, certificates). " +
 			"Several Traefik instances may be configured: call list_instances first and pass 'instance' (omit for the default). " +
+			"For troubleshooting start with health_report (overall problems) or find_route (which router/service handles a URL); " +
+			"check_tls_endpoint shows the certificate actually served. " +
 			"Object names carry a provider suffix (e.g. app@docker, secHeaders@file). A router points to a service and uses middlewares; " +
 			"service serverStatus shows whether backends are UP or DOWN. Router status 'disabled' or 'warning' comes with an 'error' list explaining the problem.",
 		Logger: log,
