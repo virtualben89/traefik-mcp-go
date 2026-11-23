@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"slices"
@@ -80,6 +81,9 @@ type apiService struct {
 }
 
 type apiMiddleware struct {
+	RedirectScheme *struct {
+		Scheme string `json:"scheme"`
+	} `json:"redirectScheme"`
 	RedirectRegex *struct {
 		Regex       string `json:"regex"`
 		Replacement string `json:"replacement"`
@@ -155,7 +159,13 @@ func (c apiCertificate) daysLeft(now time.Time) (int, bool) {
 	if err != nil {
 		return 0, false
 	}
-	return int(t.Sub(now).Hours() / 24), true
+	return daysUntil(t, now), true
+}
+
+// daysUntil returns whole days until t, rounded down: a certificate that
+// expired an hour ago yields -1, not 0.
+func daysUntil(t, now time.Time) int {
+	return int(math.Floor(t.Sub(now).Hours() / 24))
 }
 
 // fetchTyped reads all pages of a list endpoint into a typed slice.
@@ -619,13 +629,15 @@ func instanceHealth(ctx context.Context, c *traefik.Client, warnDays int, includ
 		}
 		now := time.Now()
 		for _, ct := range certs {
-			days, okDays := ct.daysLeft(now)
-			if !okDays {
-				continue
-			}
 			obj := ct.CommonName
 			if obj == "" && len(ct.SANs) > 0 {
 				obj = ct.SANs[0]
+			}
+			days, okDays := ct.daysLeft(now)
+			if !okDays {
+				addF(finding{Severity: "warning", Category: "certificate", Object: obj,
+					Message: fmt.Sprintf("cannot parse expiry date %q; check this certificate manually", ct.NotAfter), Details: ct.SANs})
+				continue
 			}
 			switch {
 			case days < 0:
@@ -647,15 +659,18 @@ func instanceHealth(ctx context.Context, c *traefik.Client, warnDays int, includ
 		for _, e := range entryPoints {
 			epByName[e.Name] = e
 		}
-		mwType := map[string]string{}
 		mwByName := map[string]apiMiddleware{}
 		for _, m := range httpMws {
-			mwType[m.Name] = strings.ToLower(m.Type)
 			mwByName[m.Name] = m
 		}
+		// Only a redirectScheme middleware that redirects to https counts.
 		isRedirect := func(names []string, provider string) bool {
 			for _, n := range names {
-				if mwType[qualify(n, provider)] == "redirectscheme" || mwType[n] == "redirectscheme" {
+				m, ok := mwByName[qualify(n, provider)]
+				if !ok || !strings.EqualFold(m.Type, "redirectscheme") {
+					continue
+				}
+				if m.RedirectScheme == nil || m.RedirectScheme.Scheme == "" || strings.EqualFold(m.RedirectScheme.Scheme, "https") {
 					return true
 				}
 			}
@@ -671,7 +686,11 @@ func instanceHealth(ctx context.Context, c *traefik.Client, warnDays int, includ
 			var plain []string
 			for _, epn := range rt.entryPoints() {
 				ep := epByName[epn]
-				if _, _, ok := ep.redirect(); ok || isRedirect(ep.HTTP.Middlewares, "") {
+				// Entry point with http.tls: every router on it is served with TLS.
+				if t := strings.TrimSpace(string(ep.HTTP.TLS)); t != "" && t != "null" {
+					continue
+				}
+				if _, scheme, ok := ep.redirect(); (ok && (scheme == "" || strings.EqualFold(scheme, "https"))) || isRedirect(ep.HTTP.Middlewares, "") {
 					continue
 				}
 				plain = append(plain, epn)

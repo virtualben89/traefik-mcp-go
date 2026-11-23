@@ -456,6 +456,58 @@ func TestDestinationAllowed(t *testing.T) {
 	}
 }
 
+func TestHealthReportHardening(t *testing.T) {
+	fx := homelabFixture()
+	fx["/certificates"] = []any{
+		map[string]any{"commonName": "justexpired.example.com", "notAfter": time.Now().Add(-time.Hour).UTC().Format(time.RFC3339), "certFingerprint": "aa"},
+		map[string]any{"commonName": "garbled.example.com", "notAfter": "next tuesday", "certFingerprint": "bb"},
+	}
+	eps := fx["/entrypoints"].([]any)
+	fx["/entrypoints"] = append(eps, map[string]any{"name": "tlsep", "address": ":8443", "http": map[string]any{"tls": map[string]any{}}})
+	routers := fx["/http/routers"].([]any)
+	fx["/http/routers"] = append(routers,
+		map[string]any{"name": "downgrade@docker", "provider": "docker", "status": "enabled", "rule": "Host(`d.example.com`)", "using": []any{"web"}, "middlewares": []any{"to-http"}, "service": "app"},
+		map[string]any{"name": "eptls@docker", "provider": "docker", "status": "enabled", "rule": "Host(`e.example.com`)", "using": []any{"tlsep"}, "service": "app"},
+	)
+	mws := fx["/http/middlewares"].([]any)
+	fx["/http/middlewares"] = append(mws, map[string]any{"name": "to-http@docker", "provider": "docker", "status": "enabled", "type": "redirectscheme", "redirectScheme": map[string]any{"scheme": "http"}})
+	s, _ := analysisSession(t, fx, Options{})
+	txt := s.ok("health_report", map[string]any{"include_info": true})
+	for _, want := range []string{`"object":"justexpired.example.com","message":"expired on`, `garbled.example.com","message":"cannot parse expiry date`, `"object":"downgrade@docker"`} {
+		if !strings.Contains(txt, want) {
+			t.Errorf("missing %s in %s", want, txt)
+		}
+	}
+	for _, unwanted := range []string{`"object":"eptls@docker"`, `"object":"app-http@docker"`} {
+		if strings.Contains(txt, unwanted) {
+			t.Errorf("unexpected %s", unwanted)
+		}
+	}
+}
+
+func TestMiddlewareSecretsMasked(t *testing.T) {
+	fx := homelabFixture()
+	auth := map[string]any{"name": "auth@docker", "provider": "docker", "status": "enabled", "type": "basicauth",
+		"basicAuth": map[string]any{"users": []any{"admin:$apr1$H6uskkkW$IgXLP6ewTrSuBkTrqE8wj/"}}}
+	fx["/http/middlewares"] = append(fx["/http/middlewares"].([]any), auth)
+	fx["/http/middlewares/auth@docker"] = auth
+	s, _ := analysisSession(t, fx, Options{})
+	for _, tool := range []string{"get_middleware", "list_middlewares"} {
+		args := map[string]any{"name": "auth@docker"}
+		if tool == "list_middlewares" {
+			args = map[string]any{"full": true}
+		}
+		txt := s.ok(tool, args)
+		if strings.Contains(txt, "$apr1$") || !strings.Contains(txt, "admin:<redacted>") {
+			t.Errorf("%s not masked: %s", tool, txt)
+		}
+	}
+	s2, _ := analysisSession(t, fx, Options{ShowSecrets: true})
+	if txt := s2.ok("get_middleware", map[string]any{"name": "auth@docker"}); !strings.Contains(txt, "$apr1$") {
+		t.Errorf("ShowSecrets: %s", txt)
+	}
+}
+
 // Every tool must survive "arguments": null without crashing the server.
 func TestAllToolsNilArguments(t *testing.T) {
 	s, _ := analysisSession(t, homelabFixture(), Options{})

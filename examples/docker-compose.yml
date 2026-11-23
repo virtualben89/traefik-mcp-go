@@ -1,6 +1,6 @@
 # Example: traefik-mcp for two Traefik instances, published via Traefik itself.
-# Create the token first:  openssl rand -hex 32 > mcp_token.txt && chmod 644 mcp_token.txt
-# (the container runs as UID 65532 and must be able to read it)
+# Create the token first (readable only by the container user, UID 65532):
+#   openssl rand -hex 32 > mcp_token.txt && sudo chown 65532:65532 mcp_token.txt && sudo chmod 400 mcp_token.txt
 services:
   traefik-mcp:
     image: ghcr.io/virtualben89/traefik-mcp-go:latest

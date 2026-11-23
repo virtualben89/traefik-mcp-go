@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"net/url"
@@ -69,6 +70,8 @@ type Config struct {
 	// TLSCheckAllowCIDRs re-allows internal destinations (loopback, private,
 	// link-local, ...) for check_tls_endpoint, which are blocked by default.
 	TLSCheckAllowCIDRs []netip.Prefix
+	// ShowSecrets disables masking of basicAuth/digestAuth password hashes.
+	ShowSecrets bool
 
 	LogLevel  string
 	LogFormat string
@@ -150,23 +153,43 @@ func ParseCIDRs(s string) ([]netip.Prefix, error) {
 	return out, nil
 }
 
+// maxSecretFile bounds *_FILE reads (a token or header list, never large).
+const maxSecretFile = 64 << 10
+
 // secretFromEnv reads KEY or, if KEY_FILE is set, the trimmed file content.
 func secretFromEnv(key string) (string, error) {
-	if f := os.Getenv(key + "_FILE"); f != "" {
-		b, err := os.ReadFile(f)
+	if name := os.Getenv(key + "_FILE"); name != "" {
+		f, err := os.Open(name)
 		if err != nil {
 			return "", fmt.Errorf("reading %s_FILE: %w", key, err)
+		}
+		defer f.Close()
+		b, err := io.ReadAll(io.LimitReader(f, maxSecretFile+1))
+		if err != nil {
+			return "", fmt.Errorf("reading %s_FILE: %w", key, err)
+		}
+		if len(b) > maxSecretFile {
+			return "", fmt.Errorf("%s_FILE is larger than %d bytes", key, maxSecretFile)
 		}
 		return strings.TrimSpace(string(b)), nil
 	}
 	return os.Getenv(key), nil
 }
 
+// headerNameRe is the RFC 9110 token syntax for header names.
+var headerNameRe = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+
+// forbiddenHeaders would break or bypass request framing and routing.
+var forbiddenHeaders = map[string]bool{
+	"host": true, "content-length": true, "transfer-encoding": true, "connection": true,
+	"upgrade": true, "te": true, "trailer": true, "keep-alive": true, "proxy-connection": true,
+}
+
 // ParseHeaders parses "Name: value" pairs separated by newlines or ";".
 func ParseHeaders(s string) (map[string]string, error) {
 	out := map[string]string{}
 	s = strings.ReplaceAll(s, "\r", "")
-	for _, part := range strings.FieldsFunc(s, func(r rune) bool { return r == '\n' || r == ';' }) {
+	for i, part := range strings.FieldsFunc(s, func(r rune) bool { return r == '\n' || r == ';' }) {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
@@ -177,7 +200,14 @@ func ParseHeaders(s string) (map[string]string, error) {
 		}
 		name = strings.TrimSpace(name)
 		if !ok || name == "" {
-			return nil, fmt.Errorf("invalid header %q, expected 'Name: value'", part)
+			// Do not echo the entry: it may contain a secret value.
+			return nil, fmt.Errorf("invalid header entry #%d, expected 'Name: value'", i+1)
+		}
+		if !headerNameRe.MatchString(name) {
+			return nil, fmt.Errorf("invalid header name %q", name)
+		}
+		if forbiddenHeaders[strings.ToLower(name)] {
+			return nil, fmt.Errorf("header %q is not allowed", name)
 		}
 		out[name] = strings.TrimSpace(value)
 	}
@@ -204,9 +234,12 @@ func EnvPrefix(name string) string {
 
 // loadInstance reads one instance. prefix is "TRAEFIK_" for single-instance
 // mode or "TRAEFIK_<NAME>_" for named instances; global values act as defaults.
-func loadInstance(name, prefix string, defTimeout time.Duration, defInsecure bool, defCA string) (Instance, error) {
+func loadInstance(name, prefix, urlOverride string, defTimeout time.Duration, defInsecure bool, defCA string) (Instance, error) {
 	in := Instance{Name: name}
 	in.URL = os.Getenv(prefix + "URL")
+	if urlOverride != "" {
+		in.URL = urlOverride
+	}
 	if in.URL == "" {
 		return in, fmt.Errorf("instance %q: %sURL is required", name, prefix)
 	}
@@ -251,6 +284,11 @@ func loadInstance(name, prefix string, defTimeout time.Duration, defInsecure boo
 	if in.Headers, err = ParseHeaders(hdrs); err != nil {
 		return in, fmt.Errorf("instance %q: %sHEADERS: %w", name, prefix, err)
 	}
+	for h := range in.Headers {
+		if strings.EqualFold(h, "Authorization") && (in.BearerToken != "" || in.BasicUser != "") {
+			return in, fmt.Errorf("instance %q: %sHEADERS must not set Authorization together with %sBEARER_TOKEN or %sBASIC_USER", name, prefix, prefix, prefix)
+		}
+	}
 	return in, nil
 }
 
@@ -277,6 +315,7 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.ToolPrefix, "tool-prefix", envOr("TOOL_PREFIX", ""), "Optional prefix for all tool names, e.g. traefik_ (env TOOL_PREFIX)")
 	perPage := fs.String("default-per-page", envOr("DEFAULT_PER_PAGE", "100"), "Default page size for list tools (env DEFAULT_PER_PAGE)")
 	warnDays := fs.String("cert-warn-days", envOr("CERT_WARN_DAYS", "21"), "health_report warns about certificates expiring within this many days (env CERT_WARN_DAYS)")
+	fs.BoolVar(&c.ShowSecrets, "show-secrets", be.get("SHOW_SECRETS", false), "Show basicAuth/digestAuth password hashes in middleware output instead of redacting them (env SHOW_SECRETS)")
 	fs.BoolVar(&c.TLSCheckEnabled, "tls-check", be.get("TLS_CHECK_ENABLED", true), "Expose check_tls_endpoint, which connects to public hosts (env TLS_CHECK_ENABLED)")
 	tlsAllow := fs.String("tls-check-allow-cidrs", envOr("TLS_CHECK_ALLOW_CIDRS", ""), "CIDRs check_tls_endpoint may connect to although they are internal (loopback, private, link-local, CGNAT), e.g. 192.168.100.0/24 (env TLS_CHECK_ALLOW_CIDRS)")
 
@@ -336,26 +375,23 @@ func Load(args []string) (*Config, error) {
 				return nil, fmt.Errorf("duplicate instance name %q", n)
 			}
 			seen[p] = true
-			in, err := loadInstance(n, p, defTimeout, defInsecure, defCA)
+			in, err := loadInstance(n, p, "", defTimeout, defInsecure, defCA)
 			if err != nil {
 				return nil, err
 			}
 			c.Instances = append(c.Instances, in)
 		}
 	} else {
-		if *traefikURL != "" {
-			if err := os.Setenv("TRAEFIK_URL", *traefikURL); err != nil {
-				return nil, err
-			}
-		}
-		if os.Getenv("TRAEFIK_URL") == "" {
+		// --traefik-url is passed directly (not copied into the process
+		// environment, where child processes or crash dumps could see it).
+		if *traefikURL == "" && os.Getenv("TRAEFIK_URL") == "" {
 			return nil, errors.New("configure TRAEFIK_URL (single instance) or TRAEFIK_INSTANCES with TRAEFIK_<NAME>_URL (multiple instances)")
 		}
 		name := strings.ToLower(envOr("TRAEFIK_INSTANCE_NAME", "default"))
 		if !nameRe.MatchString(name) {
 			return nil, fmt.Errorf("invalid TRAEFIK_INSTANCE_NAME %q", name)
 		}
-		in, err := loadInstance(name, "TRAEFIK_", defTimeout, defInsecure, defCA)
+		in, err := loadInstance(name, "TRAEFIK_", *traefikURL, defTimeout, defInsecure, defCA)
 		if err != nil {
 			return nil, err
 		}
@@ -369,6 +405,27 @@ func Load(args []string) (*Config, error) {
 	c.AuthTokens = splitList(tok)
 
 	return c, c.Validate()
+}
+
+var httpPathRe = regexp.MustCompile(`^/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*/?$`)
+
+// validateHTTPPath rejects MCP paths that would collide with the other routes
+// (net/http.ServeMux panics on duplicate patterns) or be read as patterns.
+func validateHTTPPath(p string, sse bool) error {
+	if !httpPathRe.MatchString(p) {
+		return fmt.Errorf("invalid MCP_HTTP_PATH %q (use a plain path like /mcp)", p)
+	}
+	base := "/" + strings.SplitN(strings.Trim(p, "/"), "/", 2)[0]
+	reserved := []string{"/healthz", "/readyz"}
+	if sse {
+		reserved = append(reserved, "/sse")
+	}
+	for _, r := range reserved {
+		if base == r {
+			return fmt.Errorf("MCP_HTTP_PATH %q collides with the built-in endpoint %s", p, r)
+		}
+	}
+	return nil
 }
 
 // Validate checks the configuration for consistency.
@@ -391,6 +448,9 @@ func (c *Config) Validate() error {
 		c.Transport = "http"
 		if !strings.HasPrefix(c.HTTPPath, "/") {
 			c.HTTPPath = "/" + c.HTTPPath
+		}
+		if err := validateHTTPPath(c.HTTPPath, c.HTTPEnableSSE); err != nil {
+			return err
 		}
 		if len(c.AuthTokens) == 0 && !c.AllowNoAuth {
 			return errors.New("http transport requires MCP_AUTH_TOKEN (or set MCP_ALLOW_NO_AUTH=true to explicitly run without authentication)")

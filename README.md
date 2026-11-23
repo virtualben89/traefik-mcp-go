@@ -97,6 +97,7 @@ Boolean variables accept `true`/`false` (also `1`/`0`); any other value (e.g. `o
 | `DEFAULT_PER_PAGE` | `100` | Default page size |
 | `CERT_WARN_DAYS` | `21` | `health_report` warns about certificates expiring within this many days |
 | `TLS_CHECK_ENABLED` | `true` | Expose `check_tls_endpoint` (`false` removes the tool) |
+| `SHOW_SECRETS` | `false` | Show basicAuth/digestAuth password hashes in middleware output (redacted by default, user names stay visible) |
 | `TLS_CHECK_ALLOW_CIDRS` | – | Internal ranges `check_tls_endpoint` may connect to, e.g. `192.168.100.0/24,10.0.0.5`. By default loopback, private (RFC 1918, ULA), link-local/metadata, CGNAT and other reserved addresses are refused |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / `text` | Logs always go to stderr |
 
@@ -151,6 +152,12 @@ Client configuration (Streamable HTTP):
 With Docker: `"command": "docker", "args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT=stdio", "-e", "TRAEFIK_URL=…", "ghcr.io/virtualben89/traefik-mcp-go:latest"]`.
 
 Binaries for Linux, macOS and Windows are attached to each [release](https://github.com/virtualben89/traefik-mcp-go/releases).
+Release binaries and container images carry signed SLSA build provenance; verify with the GitHub CLI:
+
+```sh
+gh attestation verify traefik-mcp_v0.3.0_linux_amd64 --repo virtualben89/traefik-mcp-go
+gh attestation verify oci://ghcr.io/virtualben89/traefik-mcp-go:0.3.0 --repo virtualben89/traefik-mcp-go
+```
 
 ## Traefik side
 
@@ -165,7 +172,8 @@ publish the API through a router on `api@internal` protected by Basic Auth, Forw
 - Browser cross-origin requests to `/mcp` and `/sse` are rejected (`Sec-Fetch-Site`/`Origin`). Without a token the `Host` header must be loopback or in `MCP_ALLOWED_HOSTS`.
 - A failing tool call returns an error result; panics are caught and never stop the server. Pagination is limited to `per_page` ≤ 500 and `page` ≤ 1,000,000; rules longer than 64 KiB or nested deeper than 100 levels are reported as unparseable.
 - `get_middleware` returns middleware configuration as Traefik exposes it. That can include Basic Auth user hashes.
-- Bearer tokens are compared in constant time (SHA-256 digests). Without `MCP_AUTH_TOKEN` the HTTP transport refuses to start unless `MCP_ALLOW_NO_AUTH=true`.
+- Bearer tokens are compared in constant time (SHA-256 digests). Each Streamable HTTP session is bound to the token that created it; another valid token cannot use it.
+- `/readyz` is unauthenticated but cached for 5 s, so it cannot be used to flood the Traefik APIs. Without `MCP_AUTH_TOKEN` the HTTP transport refuses to start unless `MCP_ALLOW_NO_AUTH=true`.
 - The container runs as UID 65532 on `scratch` (no shell).
 
 ## Development

@@ -2,6 +2,8 @@ module github.com/virtualben89/traefik-mcp-go
 
 go 1.27.0
 
+toolchain go1.27.4
+
 require (
 	github.com/google/jsonschema-go v0.4.3
 	github.com/modelcontextprotocol/go-sdk v1.8.0

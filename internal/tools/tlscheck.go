@@ -95,7 +95,7 @@ func (r *Registry) checkTLS(ctx context.Context, in CheckTLSInput) (*mcp.CallToo
 		"issuer":      strings.TrimSpace(strings.Join(leaf.Issuer.Organization, " ") + " " + leaf.Issuer.CommonName),
 		"not_before":  leaf.NotBefore.UTC().Format(time.RFC3339),
 		"not_after":   leaf.NotAfter.UTC().Format(time.RFC3339),
-		"days_left":   int(leaf.NotAfter.Sub(now).Hours() / 24),
+		"days_left":   daysUntil(leaf.NotAfter, now),
 		"serial":      leaf.SerialNumber.String(),
 		"fingerprint": fingerprint,
 		"key":         keyDesc(leaf),
