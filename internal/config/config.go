@@ -5,6 +5,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -55,12 +57,18 @@ type Config struct {
 	HTTPSessionTimeout time.Duration
 	AuthTokens         []string
 	AllowNoAuth        bool
+	// AllowedHosts are extra Host header values (besides loopback names) accepted
+	// by the MCP endpoints. Enforced always in no-auth mode, otherwise only when set.
+	AllowedHosts []string
 
 	// Behaviour
 	ToolPrefix      string
 	DefaultPerPage  int
 	CertWarnDays    int
 	TLSCheckEnabled bool
+	// TLSCheckAllowCIDRs re-allows internal destinations (loopback, private,
+	// link-local, ...) for check_tls_endpoint, which are blocked by default.
+	TLSCheckAllowCIDRs []netip.Prefix
 
 	LogLevel  string
 	LogFormat string
@@ -107,12 +115,39 @@ func envBool(key string, fallback bool) (bool, error) {
 	return b, nil
 }
 
-func mustBool(key string, fallback bool) bool {
-	b, err := envBool(key, fallback)
-	if err != nil {
-		return fallback
+// boolEnv collects boolean environment values; the first invalid value is
+// reported by Load, so an unrecognised spelling (e.g. "off") never silently
+// falls back to a permissive default.
+type boolEnv struct{ err error }
+
+func (b *boolEnv) get(key string, fallback bool) bool {
+	v, err := envBool(key, fallback)
+	if err != nil && b.err == nil {
+		b.err = fmt.Errorf("%w (use true or false)", err)
 	}
-	return b
+	return v
+}
+
+// ParseCIDRs parses a comma/space separated list of CIDRs or single IPs.
+func ParseCIDRs(s string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, t := range splitList(s) {
+		if !strings.Contains(t, "/") {
+			a, err := netip.ParseAddr(t)
+			if err != nil {
+				return nil, fmt.Errorf("invalid CIDR or IP %q", t)
+			}
+			a = a.Unmap()
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+			continue
+		}
+		p, err := netip.ParsePrefix(t)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q", t)
+		}
+		out = append(out, p.Masked())
+	}
+	return out, nil
 }
 
 // secretFromEnv reads KEY or, if KEY_FILE is set, the trimmed file content.
@@ -177,7 +212,11 @@ func loadInstance(name, prefix string, defTimeout time.Duration, defInsecure boo
 	}
 	u, err := url.Parse(in.URL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return in, fmt.Errorf("instance %q: %sURL %q must be an absolute http(s) URL", name, prefix, in.URL)
+		return in, fmt.Errorf("instance %q: %sURL must be an absolute http(s) URL", name, prefix)
+	}
+	if u.User != nil {
+		// Credentials in the URL would be sent upstream and shown by list_instances.
+		return in, fmt.Errorf("instance %q: %sURL must not contain credentials; use %sBASIC_USER and %sBASIC_PASSWORD", name, prefix, prefix, prefix)
 	}
 	in.URL = strings.TrimSuffix(strings.TrimRight(in.URL, "/"), "/api")
 
@@ -219,6 +258,7 @@ func loadInstance(name, prefix string, defTimeout time.Duration, defInsecure boo
 func Load(args []string) (*Config, error) {
 	c := &Config{}
 	fs := flag.NewFlagSet("traefik-mcp", flag.ContinueOnError)
+	var be boolEnv
 
 	traefikURL := fs.String("traefik-url", "", "Traefik API base URL for single-instance mode (overrides env TRAEFIK_URL)")
 	timeout := fs.String("traefik-timeout", envOr("TRAEFIK_TIMEOUT", "15s"), "Default HTTP timeout for Traefik API requests (env TRAEFIK_TIMEOUT)")
@@ -227,16 +267,18 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.Transport, "transport", envOr("MCP_TRANSPORT", "stdio"), "Transport: stdio or http (env MCP_TRANSPORT)")
 	fs.StringVar(&c.HTTPAddr, "http-addr", envOr("MCP_HTTP_ADDR", ":8080"), "Listen address for http transport (env MCP_HTTP_ADDR)")
 	fs.StringVar(&c.HTTPPath, "http-path", envOr("MCP_HTTP_PATH", "/mcp"), "Endpoint path for Streamable HTTP (env MCP_HTTP_PATH)")
-	fs.BoolVar(&c.HTTPStateless, "http-stateless", mustBool("MCP_HTTP_STATELESS", false), "Run Streamable HTTP in stateless mode (env MCP_HTTP_STATELESS)")
-	fs.BoolVar(&c.HTTPJSONResponse, "http-json-response", mustBool("MCP_HTTP_JSON_RESPONSE", false), "Answer with application/json instead of SSE streams (env MCP_HTTP_JSON_RESPONSE)")
-	fs.BoolVar(&c.HTTPEnableSSE, "http-enable-sse", mustBool("MCP_HTTP_ENABLE_SSE", true), "Also serve the legacy HTTP+SSE transport on /sse (env MCP_HTTP_ENABLE_SSE)")
+	fs.BoolVar(&c.HTTPStateless, "http-stateless", be.get("MCP_HTTP_STATELESS", false), "Run Streamable HTTP in stateless mode (env MCP_HTTP_STATELESS)")
+	fs.BoolVar(&c.HTTPJSONResponse, "http-json-response", be.get("MCP_HTTP_JSON_RESPONSE", false), "Answer with application/json instead of SSE streams (env MCP_HTTP_JSON_RESPONSE)")
+	fs.BoolVar(&c.HTTPEnableSSE, "http-enable-sse", be.get("MCP_HTTP_ENABLE_SSE", true), "Also serve the legacy HTTP+SSE transport on /sse (env MCP_HTTP_ENABLE_SSE)")
 	sessTimeout := fs.String("http-session-timeout", envOr("MCP_HTTP_SESSION_TIMEOUT", "30m"), "Idle timeout for HTTP sessions, 0 disables (env MCP_HTTP_SESSION_TIMEOUT)")
-	fs.BoolVar(&c.AllowNoAuth, "allow-no-auth", mustBool("MCP_ALLOW_NO_AUTH", false), "Allow http transport without bearer token (env MCP_ALLOW_NO_AUTH)")
+	fs.BoolVar(&c.AllowNoAuth, "allow-no-auth", be.get("MCP_ALLOW_NO_AUTH", false), "Allow http transport without bearer token (env MCP_ALLOW_NO_AUTH)")
+	allowedHosts := fs.String("allowed-hosts", envOr("MCP_ALLOWED_HOSTS", ""), "Extra Host header values accepted by the MCP endpoints besides localhost; required for non-local access in no-auth mode (env MCP_ALLOWED_HOSTS)")
 
 	fs.StringVar(&c.ToolPrefix, "tool-prefix", envOr("TOOL_PREFIX", ""), "Optional prefix for all tool names, e.g. traefik_ (env TOOL_PREFIX)")
 	perPage := fs.String("default-per-page", envOr("DEFAULT_PER_PAGE", "100"), "Default page size for list tools (env DEFAULT_PER_PAGE)")
 	warnDays := fs.String("cert-warn-days", envOr("CERT_WARN_DAYS", "21"), "health_report warns about certificates expiring within this many days (env CERT_WARN_DAYS)")
-	fs.BoolVar(&c.TLSCheckEnabled, "tls-check", mustBool("TLS_CHECK_ENABLED", true), "Expose check_tls_endpoint, which connects to arbitrary hosts (env TLS_CHECK_ENABLED)")
+	fs.BoolVar(&c.TLSCheckEnabled, "tls-check", be.get("TLS_CHECK_ENABLED", true), "Expose check_tls_endpoint, which connects to public hosts (env TLS_CHECK_ENABLED)")
+	tlsAllow := fs.String("tls-check-allow-cidrs", envOr("TLS_CHECK_ALLOW_CIDRS", ""), "CIDRs check_tls_endpoint may connect to although they are internal (loopback, private, link-local, CGNAT), e.g. 192.168.100.0/24 (env TLS_CHECK_ALLOW_CIDRS)")
 
 	fs.StringVar(&c.LogLevel, "log-level", envOr("LOG_LEVEL", "info"), "debug, info, warn, error (env LOG_LEVEL)")
 	fs.StringVar(&c.LogFormat, "log-format", envOr("LOG_FORMAT", "text"), "text or json (env LOG_FORMAT)")
@@ -244,13 +286,27 @@ func Load(args []string) (*Config, error) {
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
+	if be.err != nil {
+		return nil, be.err
+	}
+	var err error
+	if c.TLSCheckAllowCIDRs, err = ParseCIDRs(*tlsAllow); err != nil {
+		return nil, fmt.Errorf("TLS_CHECK_ALLOW_CIDRS: %w", err)
+	}
+	for _, h := range splitList(*allowedHosts) {
+		h = strings.ToLower(h)
+		if hh, _, err := net.SplitHostPort(h); err == nil {
+			h = hh
+		}
+		c.AllowedHosts = append(c.AllowedHosts, strings.Trim(h, "[]"))
+	}
 
 	defTimeout, err := time.ParseDuration(*timeout)
 	if err != nil || defTimeout <= 0 {
 		return nil, fmt.Errorf("invalid TRAEFIK_TIMEOUT %q", *timeout)
 	}
-	if c.HTTPSessionTimeout, err = time.ParseDuration(*sessTimeout); err != nil {
-		return nil, fmt.Errorf("invalid MCP_HTTP_SESSION_TIMEOUT: %w", err)
+	if c.HTTPSessionTimeout, err = time.ParseDuration(*sessTimeout); err != nil || c.HTTPSessionTimeout < 0 {
+		return nil, fmt.Errorf("invalid MCP_HTTP_SESSION_TIMEOUT %q (use a duration >= 0, 0 disables)", *sessTimeout)
 	}
 	if c.DefaultPerPage, err = strconv.Atoi(*perPage); err != nil || c.DefaultPerPage <= 0 {
 		return nil, fmt.Errorf("invalid DEFAULT_PER_PAGE %q", *perPage)

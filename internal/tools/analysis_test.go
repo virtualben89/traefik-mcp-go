@@ -1,13 +1,20 @@
 package tools
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
@@ -323,13 +330,30 @@ func TestCheckTLS(t *testing.T) {
 	pool.AddCert(tlsSrv.Certificate())
 	rootCAs = pool
 	t.Cleanup(func() { rootCAs = nil })
-
-	fp := sha256.Sum256(tlsSrv.Certificate().Raw)
-	fx := homelabFixture()
-	fx["/certificates"] = []any{map[string]any{"commonName": "x", "notAfter": day(10), "certFingerprint": hex.EncodeToString(fp[:])}}
-	s, _ := analysisSession(t, fx, Options{Order: []string{"a", "b"}})
-
 	u, _ := url.Parse(tlsSrv.URL)
+
+	// Internal destinations are refused by default (resolved IP is checked).
+	sDef, _ := analysisSession(t, homelabFixture(), Options{})
+	for _, host := range []string{u.Host, "localhost:" + u.Port(), "[::1]:" + u.Port(), "10.1.2.3", "169.254.169.254:80", "[::ffff:127.0.0.1]:" + u.Port()} {
+		if txt, isErr := call(t, sDef.cs, "check_tls_endpoint", map[string]any{"host": host}); !isErr || !strings.Contains(txt, "internal address") {
+			t.Errorf("%s must be blocked: %s", host, txt)
+		}
+	}
+	if txt, isErr := call(t, sDef.cs, "check_tls_endpoint", map[string]any{"host": "x:abc"}); !isErr || !strings.Contains(txt, "invalid port") {
+		t.Errorf("invalid port: %s", txt)
+	}
+
+	// Store entry: same certificate, fingerprint in upper case with colons (normalised).
+	fp := sha256.Sum256(tlsSrv.Certificate().Raw)
+	var colon []string
+	for _, b := range fp {
+		colon = append(colon, strings.ToUpper(hex.EncodeToString([]byte{b})))
+	}
+	fx := homelabFixture()
+	fx["/certificates"] = []any{map[string]any{"commonName": "x", "notAfter": day(10), "certFingerprint": strings.Join(colon, ":")}}
+	allow := []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
+	s, _ := analysisSession(t, fx, Options{Order: []string{"a", "b"}, TLSCheckAllowCIDRs: allow})
+
 	var out map[string]any
 	s.decode("check_tls_endpoint", map[string]any{"host": u.Host, "sni": "example.com"}, &out)
 	if out["verified"] != true || out["tls_version"] == "" {
@@ -343,6 +367,12 @@ func TestCheckTLS(t *testing.T) {
 	if out["verified"] != false || out["verify_error"] == nil {
 		t.Errorf("hostname mismatch not detected: %v", out)
 	}
+	// IP target without SNI: httptest's certificate carries IP SAN 127.0.0.1.
+	out = nil
+	s.decode("check_tls_endpoint", map[string]any{"host": u.Host}, &out)
+	if out["verified"] != true {
+		t.Errorf("IP SAN match: %v", out)
+	}
 	if txt, isErr := call(t, s.cs, "check_tls_endpoint", map[string]any{"host": "127.0.0.1", "port": 1}); !isErr || !strings.Contains(txt, "handshake") {
 		t.Errorf("closed port: %s", txt)
 	}
@@ -351,6 +381,78 @@ func TestCheckTLS(t *testing.T) {
 	s3, _ := analysisSession(t, homelabFixture(), Options{DisableTLSCheck: true})
 	if txt, isErr := call(t, s3.cs, "check_tls_endpoint", map[string]any{"host": "x"}); !isErr {
 		t.Errorf("tool should be absent: %s", txt)
+	}
+}
+
+// selfSigned serves a certificate for unrelated.test (no IP SAN) with serial 4242.
+func selfSigned(t *testing.T) (addr string, pool *x509.CertPool) {
+	t.Helper()
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tpl := &x509.Certificate{
+		SerialNumber: big.NewInt(4242), Subject: pkix.Name{CommonName: "unrelated.test"}, DNSNames: []string{"unrelated.test"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, _ := x509.ParseCertificate(der)
+	pool = x509.NewCertPool()
+	pool.AddCert(cert)
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _ = c.(*tls.Conn).Handshake(); _ = c.Close() }()
+		}
+	}()
+	return ln.Addr().String(), pool
+}
+
+// Regression: an IP target must be verified against the IP, and a store entry
+// may only match by fingerprint, not by (public) serial number.
+func TestCheckTLSIdentityAndStoreMatch(t *testing.T) {
+	addr, pool := selfSigned(t)
+	rootCAs = pool
+	t.Cleanup(func() { rootCAs = nil })
+	fx := homelabFixture()
+	fx["/certificates"] = []any{map[string]any{"commonName": "legit.test", "notAfter": day(10), "serialNumber": "4242",
+		"certFingerprint": strings.Repeat("ab", 32)}}
+	s, _ := analysisSession(t, fx, Options{TLSCheckAllowCIDRs: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}})
+	var out map[string]any
+	s.decode("check_tls_endpoint", map[string]any{"host": addr}, &out)
+	if out["verified"] != false || out["verify_error"] == nil {
+		t.Errorf("certificate without IP SAN must not verify for an IP target: %v", out)
+	}
+	if _, ok := out["in_traefik_store"]; ok {
+		t.Errorf("serial-only match must not count: %v", out)
+	}
+	out = nil
+	s.decode("check_tls_endpoint", map[string]any{"host": addr, "sni": "unrelated.test"}, &out)
+	if out["verified"] != true {
+		t.Errorf("explicit SNI: %v", out)
+	}
+}
+
+func TestDestinationAllowed(t *testing.T) {
+	allow := []netip.Prefix{netip.MustParsePrefix("192.168.100.0/24")}
+	for ip, want := range map[string]bool{
+		"1.1.1.1": true, "2606:4700::1111": true, "192.168.100.21": true,
+		"192.168.1.1": false, "10.0.0.1": false, "172.16.5.5": false, "127.0.0.1": false, "100.100.1.1": false,
+		"169.254.169.254": false, "0.0.0.0": false, "::1": false, "fd00::1": false, "fe80::1": false, "::ffff:10.0.0.1": false,
+	} {
+		if got := destinationAllowed(netip.MustParseAddr(ip), allow); got != want {
+			t.Errorf("%s: got %v want %v", ip, got, want)
+		}
 	}
 }
 

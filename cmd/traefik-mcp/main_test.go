@@ -162,9 +162,104 @@ func TestReadyzDegraded(t *testing.T) {
 	}
 }
 
+// Regression (DNS rebinding): without bearer auth only loopback Host headers and
+// MCP_ALLOWED_HOSTS reach the MCP endpoints, independent of the listener address.
+func TestNoAuthHostGuard(t *testing.T) {
+	ts := setup(t, &config.Config{AllowNoAuth: true, HTTPEnableSSE: true, AllowedHosts: []string{"traefik-mcp"}}, nil)
+	initBody := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`
+	post := func(path, host string, hdr map[string]string) int {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(initBody))
+		req.Host = host
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	for host, want := range map[string]int{
+		"attacker.example:8080": http.StatusForbidden,
+		"192.168.1.5:8080":      http.StatusForbidden,
+		"localhost:8080":        http.StatusOK,
+		"127.0.0.1:8080":        http.StatusOK,
+		"[::1]:8080":            http.StatusOK,
+		"traefik-mcp:8080":      http.StatusOK,
+	} {
+		if got := post("/mcp", host, nil); got != want {
+			t.Errorf("/mcp Host %s: got %d want %d", host, got, want)
+		}
+	}
+	if got := post("/sse", "attacker.example", nil); got != http.StatusForbidden {
+		t.Errorf("/sse foreign host: %d", got)
+	}
+	// Browser cross-origin request with an allowed Host (e.g. from another local page).
+	if got := post("/mcp", "localhost:8080", map[string]string{"Sec-Fetch-Site": "cross-site", "Origin": "http://evil.example"}); got != http.StatusForbidden {
+		t.Errorf("cross-origin browser request: %d", got)
+	}
+	// Health endpoints stay reachable for probes.
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/healthz", nil)
+	req.Host = "attacker.example"
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusOK {
+		t.Errorf("healthz: %v %v", err, resp)
+	}
+}
+
+// Regression: invalid booleans, credentials in URLs and bad CIDRs fail startup.
+func TestConfigStrict(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("TRAEFIK_URL", "https://traefik.example.com")
+	for _, k := range []string{"TLS_CHECK_ENABLED", "MCP_HTTP_ENABLE_SSE", "MCP_ALLOW_NO_AUTH", "MCP_HTTP_STATELESS"} {
+		for _, v := range []string{"off", "no", "disabled"} {
+			t.Setenv(k, v)
+			if _, err := config.Load(nil); err == nil || !strings.Contains(err.Error(), k) {
+				t.Errorf("%s=%s must fail: %v", k, v, err)
+			}
+		}
+		t.Setenv(k, "")
+	}
+	t.Setenv("TLS_CHECK_ENABLED", "false")
+	if cfg, err := config.Load(nil); err != nil || cfg.TLSCheckEnabled {
+		t.Errorf("TLS_CHECK_ENABLED=false: %v %+v", err, cfg)
+	}
+	t.Setenv("TLS_CHECK_ENABLED", "")
+
+	t.Setenv("TRAEFIK_URL", "https://user:s3cret@traefik.example.com")
+	if _, err := config.Load(nil); err == nil || strings.Contains(err.Error(), "s3cret") || !strings.Contains(err.Error(), "credentials") {
+		t.Errorf("userinfo URL: %v", err)
+	}
+	t.Setenv("TRAEFIK_URL", "https://traefik.example.com")
+
+	t.Setenv("TLS_CHECK_ALLOW_CIDRS", "192.168.100.0/24, 10.0.0.5")
+	if cfg, err := config.Load(nil); err != nil || len(cfg.TLSCheckAllowCIDRs) != 2 || cfg.TLSCheckAllowCIDRs[1].String() != "10.0.0.5/32" {
+		t.Errorf("allow cidrs: %v %+v", err, cfg)
+	}
+	t.Setenv("TLS_CHECK_ALLOW_CIDRS", "not-a-cidr")
+	if _, err := config.Load(nil); err == nil {
+		t.Error("invalid CIDR must fail")
+	}
+	t.Setenv("TLS_CHECK_ALLOW_CIDRS", "")
+
+	t.Setenv("MCP_HTTP_SESSION_TIMEOUT", "-5m")
+	if _, err := config.Load(nil); err == nil {
+		t.Error("negative session timeout must fail")
+	}
+	t.Setenv("MCP_HTTP_SESSION_TIMEOUT", "")
+
+	t.Setenv("MCP_ALLOWED_HOSTS", "MCP.example.com:8443, traefik-mcp")
+	if cfg, err := config.Load(nil); err != nil || strings.Join(cfg.AllowedHosts, ",") != "mcp.example.com,traefik-mcp" {
+		t.Errorf("allowed hosts: %v %+v", err, cfg)
+	}
+}
+
 func clearEnv(t *testing.T) {
 	for _, k := range []string{"TRAEFIK_URL", "TRAEFIK_INSTANCES", "TRAEFIK_INSTANCE_NAME", "TRAEFIK_DEFAULT_INSTANCE",
-		"TRAEFIK_BASIC_USER", "TRAEFIK_BASIC_PASSWORD", "TRAEFIK_BEARER_TOKEN", "MCP_TRANSPORT", "MCP_AUTH_TOKEN", "MCP_ALLOW_NO_AUTH"} {
+		"TRAEFIK_BASIC_USER", "TRAEFIK_BASIC_PASSWORD", "TRAEFIK_BEARER_TOKEN", "MCP_TRANSPORT", "MCP_AUTH_TOKEN", "MCP_ALLOW_NO_AUTH",
+		"TLS_CHECK_ENABLED", "TLS_CHECK_ALLOW_CIDRS", "MCP_HTTP_ENABLE_SSE", "MCP_HTTP_STATELESS", "MCP_HTTP_SESSION_TIMEOUT", "MCP_ALLOWED_HOSTS"} {
 		t.Setenv(k, "")
 	}
 }

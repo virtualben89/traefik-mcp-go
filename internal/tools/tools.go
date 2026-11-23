@@ -7,7 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/netip"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,9 +39,17 @@ type Options struct {
 	Order []string
 	// CertWarnDays is the default warning threshold for expiring certificates.
 	CertWarnDays int
-	// DisableTLSCheck removes the check_tls_endpoint tool (it connects to arbitrary hosts).
+	// DisableTLSCheck removes the check_tls_endpoint tool (it connects to other hosts).
 	DisableTLSCheck bool
+	// TLSCheckAllowCIDRs re-allows internal destinations for check_tls_endpoint.
+	TLSCheckAllowCIDRs []netip.Prefix
 }
+
+// Pagination limits; Traefik itself caps per_page as well.
+const (
+	maxPerPage = 500
+	maxPage    = 1_000_000
+)
 
 // Registry adds tools to a server.
 type Registry struct {
@@ -88,6 +99,13 @@ func add[In any](r *Registry, d toolDef, h func(context.Context, In) (*mcp.CallT
 		}
 		s.Enum = vals
 	}
+	// Bound pagination parameters in the schema as well (validated again in code).
+	for prop, maxV := range map[string]float64{"page": maxPage, "per_page": maxPerPage} {
+		if s, ok := schema.Properties[prop]; ok {
+			s.Minimum = ptr(0.0)
+			s.Maximum = ptr(maxV)
+		}
+	}
 	// Deliberately no schema "default" values: go-sdk panics applying defaults
 	// when a client sends "arguments": null. Defaults are applied in code.
 
@@ -104,12 +122,19 @@ func add[In any](r *Registry, d toolDef, h func(context.Context, In) (*mcp.CallT
 			OpenWorldHint:  ptr(d.openWorld),
 		},
 	}
-	mcp.AddTool(r.srv, tool, func(ctx context.Context, _ *mcp.CallToolRequest, in In) (*mcp.CallToolResult, any, error) {
-		res, err := h(ctx, in)
+	mcp.AddTool(r.srv, tool, func(ctx context.Context, _ *mcp.CallToolRequest, in In) (res *mcp.CallToolResult, _ any, _ error) {
+		// A bug in one tool call must never take down the whole (shared) server.
+		defer func() {
+			if v := recover(); v != nil {
+				slog.Error("tool panic", "tool", name, "panic", v, "stack", string(debug.Stack()))
+				res = errorResult(fmt.Errorf("internal error in %s; please report this", name))
+			}
+		}()
+		out, err := h(ctx, in)
 		if err != nil {
 			return errorResult(err), nil, nil
 		}
-		return res, nil, nil
+		return out, nil, nil
 	})
 	r.names = append(r.names, name)
 }
@@ -143,6 +168,15 @@ func decodeExact(b []byte, v any) error {
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.UseNumber()
 	return d.Decode(v)
+}
+
+// recoverAs is deferred in worker goroutines: a panic there would otherwise
+// terminate the process (go-sdk does not recover). onPanic records the failure.
+func recoverAs(onPanic func(error)) {
+	if v := recover(); v != nil {
+		slog.Error("worker panic", "panic", v, "stack", string(debug.Stack()))
+		onPanic(fmt.Errorf("internal error: %v", v))
+	}
 }
 
 func errorResult(err error) *mcp.CallToolResult {
@@ -282,8 +316,8 @@ func (r *Registry) list(ctx context.Context, k kind, p listParams) (*mcp.CallToo
 	if err != nil {
 		return nil, err
 	}
-	if p.page < 0 || p.perPage < 0 {
-		return nil, errors.New("page and per_page must be positive")
+	if p.page < 0 || p.perPage < 0 || p.page > maxPage || p.perPage > maxPerPage {
+		return nil, fmt.Errorf("page must be 1..%d and per_page 1..%d", maxPage, maxPerPage)
 	}
 	if p.page == 0 {
 		p.page = 1
@@ -315,6 +349,7 @@ func (r *Registry) list(ctx context.Context, k kind, p listParams) (*mcp.CallToo
 				items = append(items, it)
 			}
 		}
+		// Both factors are bounded above, so the product cannot overflow.
 		start := (p.page - 1) * p.perPage
 		if start >= len(items) {
 			items = nil
@@ -387,10 +422,10 @@ func fetchAll(ctx context.Context, c *traefik.Client, path string, base url.Valu
 		}
 		all = append(all, items...)
 		if resp.NextPage == 0 {
-			break
+			return all, nil
 		}
 	}
-	return all, nil
+	return nil, fmt.Errorf("%s: more than 1000 pages, refusing to analyse truncated data", path)
 }
 
 // sameName compares object references; the provider suffix is only compared
@@ -523,6 +558,7 @@ func (r *Registry) registerAll() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				defer recoverAs(func(err error) { row["reachable"], row["error"] = false, err.Error() })
 				pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 				defer cancel()
 				v, err := inst.Client.Version(pctx)
@@ -661,7 +697,8 @@ func (r *Registry) registerAll() {
 			title: "Check TLS endpoint",
 			description: "Connect to host:port, perform a TLS handshake and report the certificate actually served (subject, SANs, issuer, " +
 				"validity, days_left, fingerprint), chain/hostname verification, TLS version and ALPN. Detects Traefik's self-signed default " +
-				"certificate and whether the certificate is in a Traefik instance's store.",
+				"certificate and whether the certificate is in a Traefik instance's store. Internal addresses (private, loopback, link-local) " +
+				"are refused unless the operator allowed them.",
 			enums:     map[string][]any{"instance": instEnum},
 			openWorld: true,
 		}, r.checkTLS)

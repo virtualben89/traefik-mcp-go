@@ -229,6 +229,11 @@ func (r *Registry) perInstance(ctx context.Context, names []string, f func(conte
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer recoverAs(func(err error) {
+				mu.Lock()
+				out[n] = map[string]any{"error": err.Error()}
+				mu.Unlock()
+			})
 			v := f(ctx, n, r.instances[n])
 			mu.Lock()
 			out[n] = v
@@ -512,6 +517,7 @@ func instanceHealth(ctx context.Context, c *traefik.Client, warnDays int, includ
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
+			defer recoverAs(addErr)
 			routers, err := fetchTyped[apiRouter](ctx, c, "/"+proto+"/routers")
 			if err != nil {
 				addErr(err)
@@ -534,6 +540,7 @@ func instanceHealth(ctx context.Context, c *traefik.Client, warnDays int, includ
 		}()
 		go func() {
 			defer wg.Done()
+			defer recoverAs(addErr)
 			services, err := fetchTyped[apiService](ctx, c, "/"+proto+"/services")
 			if err != nil {
 				addErr(err)
@@ -565,6 +572,7 @@ func instanceHealth(ctx context.Context, c *traefik.Client, warnDays int, includ
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer recoverAs(addErr)
 			mws, err := fetchTyped[apiMiddleware](ctx, c, "/"+proto+"/middlewares")
 			if err != nil {
 				addErr(err)
@@ -585,6 +593,7 @@ func instanceHealth(ctx context.Context, c *traefik.Client, warnDays int, includ
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
+		defer recoverAs(addErr)
 		eps, err := fetchTyped[apiEntryPoint](ctx, c, "/entrypoints")
 		if err != nil {
 			addErr(err)
@@ -596,6 +605,7 @@ func instanceHealth(ctx context.Context, c *traefik.Client, warnDays int, includ
 	}()
 	go func() {
 		defer wg.Done()
+		defer recoverAs(addErr)
 		certs, ok, err := fetchCertificates(ctx, c)
 		if err != nil {
 			addErr(err)
