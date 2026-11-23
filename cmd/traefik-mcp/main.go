@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -147,6 +148,7 @@ func run() error {
 		CertWarnDays:       cfg.CertWarnDays,
 		DisableTLSCheck:    !cfg.TLSCheckEnabled,
 		TLSCheckAllowCIDRs: cfg.TLSCheckAllowCIDRs,
+		ShowSecrets:        cfg.ShowSecrets,
 	}
 	server, names := NewServer(instances, toolOpts, log)
 	log.Info("traefik-mcp starting", "version", version, "transport", cfg.Transport,
@@ -238,7 +240,10 @@ func bearerVerifier(tokens []string) auth.TokenVerifier {
 			return nil, auth.ErrInvalidToken
 		}
 		// Static tokens do not expire; give the middleware a rolling expiry.
-		return &auth.TokenInfo{Expiration: time.Now().Add(time.Hour)}, nil
+		// UserID binds Streamable HTTP sessions to the token that created them,
+		// so one token holder cannot drive another token's session. It is a
+		// digest prefix (stable across rotation order, never the token itself).
+		return &auth.TokenInfo{Expiration: time.Now().Add(time.Hour), UserID: "token-" + hex.EncodeToString(h[:8])}, nil
 	}
 }
 
@@ -268,6 +273,9 @@ func serveHTTP(ctx context.Context, cfg *config.Config, server *mcp.Server, inst
 		return srv.Shutdown(sctx)
 	}
 }
+
+// readyCacheTTL bounds how often /readyz probes the upstream instances.
+var readyCacheTTL = 5 * time.Second
 
 // buildHandler assembles the HTTP routes: MCP endpoints (auth-protected) and health probes.
 func buildHandler(cfg *config.Config, server *mcp.Server, instances map[string]tools.Instance, log *slog.Logger) http.Handler {
@@ -314,8 +322,21 @@ func buildHandler(cfg *config.Config, server *mcp.Server, instances map[string]t
 	})
 	// /readyz is ready when every configured Traefik instance answers /api/version.
 	// It only reports instance names and ok/fail, no upstream details.
+	// The endpoint is unauthenticated, so results are cached briefly and
+	// concurrent callers share one probe instead of fanning out upstream.
+	var (
+		readyMu  sync.Mutex
+		readyAt  time.Time
+		readyRes map[string]probeStatus
+	)
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		res := probeAll(r.Context(), instances, 5*time.Second)
+		readyMu.Lock()
+		if time.Since(readyAt) > readyCacheTTL {
+			readyRes = probeAll(context.WithoutCancel(r.Context()), instances, 5*time.Second)
+			readyAt = time.Now()
+		}
+		res := readyRes
+		readyMu.Unlock()
 		body := map[string]string{}
 		code := http.StatusOK
 		for name, st := range res {

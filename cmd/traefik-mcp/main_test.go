@@ -7,7 +7,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -162,6 +165,62 @@ func TestReadyzDegraded(t *testing.T) {
 	}
 }
 
+// A session belongs to the token that created it.
+func TestSessionBoundToToken(t *testing.T) {
+	tokA, tokB := testToken, testToken+"-second"
+	ts := setup(t, &config.Config{AuthTokens: []string{tokA, tokB}}, nil)
+	post := func(tok, sid, body string) (int, string) {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		if sid != "" {
+			req.Header.Set("Mcp-Session-Id", sid)
+			req.Header.Set("Mcp-Protocol-Version", "2025-06-18")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode, resp.Header.Get("Mcp-Session-Id")
+	}
+	code, sid := post(tokA, "", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"a","version":"1"}}}`)
+	if code != http.StatusOK || sid == "" {
+		t.Fatalf("initialize: %d %q", code, sid)
+	}
+	list := `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`
+	if code, _ := post(tokB, sid, list); code != http.StatusForbidden {
+		t.Errorf("other token on session: got %d, want 403", code)
+	}
+	if code, _ := post(tokA, sid, list); code != http.StatusOK {
+		t.Errorf("own token on session: got %d", code)
+	}
+}
+
+// /readyz is cached: repeated unauthenticated calls do not fan out upstream.
+func TestReadyzCached(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"Version":"3.7.0"}`)
+	}))
+	t.Cleanup(up.Close)
+	ts := setup(t, &config.Config{AuthTokens: []string{testToken}}, map[string]string{"up": up.URL})
+	for range 20 {
+		resp, err := http.Get(ts.URL + "/readyz")
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("readyz: %v %v", err, resp)
+		}
+		resp.Body.Close()
+	}
+	if n := hits.Load(); n > 2 {
+		t.Errorf("readyz probed upstream %d times for 20 requests", n)
+	}
+}
+
 // Regression (DNS rebinding): without bearer auth only loopback Host headers and
 // MCP_ALLOWED_HOSTS reach the MCP endpoints, independent of the listener address.
 func TestNoAuthHostGuard(t *testing.T) {
@@ -250,6 +309,65 @@ func TestConfigStrict(t *testing.T) {
 	}
 	t.Setenv("MCP_HTTP_SESSION_TIMEOUT", "")
 
+	t.Setenv("MCP_TRANSPORT", "http")
+	t.Setenv("MCP_AUTH_TOKEN", testToken)
+	for _, p := range []string{"/sse", "/healthz", "/readyz/x", "/", "GET /mcp", "/a b"} {
+		t.Setenv("MCP_HTTP_PATH", p)
+		if _, err := config.Load(nil); err == nil {
+			t.Errorf("MCP_HTTP_PATH %q must fail", p)
+		}
+	}
+	t.Setenv("MCP_HTTP_PATH", "/api/mcp")
+	if _, err := config.Load(nil); err != nil {
+		t.Errorf("/api/mcp: %v", err)
+	}
+	t.Setenv("MCP_HTTP_PATH", "")
+	t.Setenv("MCP_TRANSPORT", "")
+	t.Setenv("MCP_AUTH_TOKEN", "")
+
+	for hdr, ok := range map[string]bool{
+		"X-Api-Key: abc":         true,
+		"Authorization: Token x": true,
+		"Host: evil.example":     false,
+		"Content-Length: 5":      false,
+		"Bad Name: x":            false,
+		"no-separator-secret":    false,
+	} {
+		t.Setenv("TRAEFIK_HEADERS", hdr)
+		_, err := config.Load(nil)
+		if (err == nil) != ok {
+			t.Errorf("header %q: %v", hdr, err)
+		}
+		if err != nil && strings.Contains(err.Error(), "secret") {
+			t.Errorf("error echoes header content: %v", err)
+		}
+	}
+	t.Setenv("TRAEFIK_HEADERS", "Authorization: Token x")
+	t.Setenv("TRAEFIK_BEARER_TOKEN", "tok")
+	if _, err := config.Load(nil); err == nil {
+		t.Error("Authorization header + bearer token must fail")
+	}
+	t.Setenv("TRAEFIK_HEADERS", "")
+	t.Setenv("TRAEFIK_BEARER_TOKEN", "")
+
+	big := filepath.Join(t.TempDir(), "big")
+	_ = os.WriteFile(big, make([]byte, 70<<10), 0o600)
+	t.Setenv("MCP_AUTH_TOKEN_FILE", big)
+	if _, err := config.Load(nil); err == nil || !strings.Contains(err.Error(), "larger") {
+		t.Errorf("oversized token file: %v", err)
+	}
+	t.Setenv("MCP_AUTH_TOKEN_FILE", "")
+
+	// --traefik-url must not leak into the process environment.
+	t.Setenv("TRAEFIK_URL", "")
+	if _, err := config.Load([]string{"--traefik-url", "http://flag.example:8080"}); err != nil {
+		t.Fatal(err)
+	}
+	if v := os.Getenv("TRAEFIK_URL"); v != "" {
+		t.Errorf("TRAEFIK_URL set from flag: %q", v)
+	}
+	t.Setenv("TRAEFIK_URL", "https://traefik.example.com")
+
 	t.Setenv("MCP_ALLOWED_HOSTS", "MCP.example.com:8443, traefik-mcp")
 	if cfg, err := config.Load(nil); err != nil || strings.Join(cfg.AllowedHosts, ",") != "mcp.example.com,traefik-mcp" {
 		t.Errorf("allowed hosts: %v %+v", err, cfg)
@@ -259,7 +377,8 @@ func TestConfigStrict(t *testing.T) {
 func clearEnv(t *testing.T) {
 	for _, k := range []string{"TRAEFIK_URL", "TRAEFIK_INSTANCES", "TRAEFIK_INSTANCE_NAME", "TRAEFIK_DEFAULT_INSTANCE",
 		"TRAEFIK_BASIC_USER", "TRAEFIK_BASIC_PASSWORD", "TRAEFIK_BEARER_TOKEN", "MCP_TRANSPORT", "MCP_AUTH_TOKEN", "MCP_ALLOW_NO_AUTH",
-		"TLS_CHECK_ENABLED", "TLS_CHECK_ALLOW_CIDRS", "MCP_HTTP_ENABLE_SSE", "MCP_HTTP_STATELESS", "MCP_HTTP_SESSION_TIMEOUT", "MCP_ALLOWED_HOSTS"} {
+		"TLS_CHECK_ENABLED", "TLS_CHECK_ALLOW_CIDRS", "MCP_HTTP_ENABLE_SSE", "MCP_HTTP_STATELESS", "MCP_HTTP_SESSION_TIMEOUT", "MCP_ALLOWED_HOSTS",
+		"MCP_HTTP_PATH", "TRAEFIK_HEADERS", "MCP_AUTH_TOKEN_FILE", "SHOW_SECRETS"} {
 		t.Setenv(k, "")
 	}
 }

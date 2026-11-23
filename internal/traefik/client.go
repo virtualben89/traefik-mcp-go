@@ -66,7 +66,8 @@ func (e *APIError) Error() string {
 	case http.StatusUnauthorized, http.StatusForbidden:
 		hint = " (check the upstream credentials for this instance)"
 	}
-	return fmt.Sprintf("traefik[%s] GET %s: HTTP %d: %s%s", e.Instance, e.Path, e.Status, msg, hint)
+	// The message comes from the upstream and is untrusted text; label it as such.
+	return fmt.Sprintf("traefik[%s] GET %s: HTTP %d, upstream message: %q%s", e.Instance, e.Path, e.Status, msg, hint)
 }
 
 // IsNotFound reports whether err is a 404 from Traefik.

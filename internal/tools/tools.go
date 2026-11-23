@@ -43,6 +43,9 @@ type Options struct {
 	DisableTLSCheck bool
 	// TLSCheckAllowCIDRs re-allows internal destinations for check_tls_endpoint.
 	TLSCheckAllowCIDRs []netip.Prefix
+	// ShowSecrets disables masking of credentials in middleware configs
+	// (basicAuth/digestAuth user hashes).
+	ShowSecrets bool
 }
 
 // Pagination limits; Traefik itself caps per_page as well.
@@ -176,6 +179,30 @@ func recoverAs(onPanic func(error)) {
 	if v := recover(); v != nil {
 		slog.Error("worker panic", "panic", v, "stack", string(debug.Stack()))
 		onPanic(fmt.Errorf("internal error: %v", v))
+	}
+}
+
+// secretUserLists are middleware fields holding "user:hash" entries.
+var secretUserLists = []string{"basicAuth", "digestAuth"}
+
+// maskSecrets replaces password hashes in middleware objects with a marker,
+// keeping the user names (useful for troubleshooting, harmless to show).
+func maskSecrets(mw map[string]any) {
+	for _, key := range secretUserLists {
+		cfg, ok := mw[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		users, ok := cfg["users"].([]any)
+		if !ok {
+			continue
+		}
+		for i, u := range users {
+			if s, ok := u.(string); ok {
+				name, _, _ := strings.Cut(s, ":")
+				users[i] = name + ":<redacted>"
+			}
+		}
 	}
 }
 
@@ -387,6 +414,11 @@ func (r *Registry) list(ctx context.Context, k kind, p listParams) (*mcp.CallToo
 	if !p.full {
 		slim(items)
 	}
+	if k == kMiddlewares && !r.opts.ShowSecrets {
+		for _, it := range items {
+			maskSecrets(it)
+		}
+	}
 	out := map[string]any{
 		"instance": iname,
 		"protocol": proto,
@@ -525,6 +557,9 @@ func (r *Registry) get(ctx context.Context, k kind, in GetInput) (*mcp.CallToolR
 	if err := decodeExact(resp.Body, &obj); err != nil {
 		return nil, fmt.Errorf("decoding %s: %w", k.single, err)
 	}
+	if k == kMiddlewares && !r.opts.ShowSecrets {
+		maskSecrets(obj)
+	}
 	return valueResult(map[string]any{"instance": iname, "protocol": proto, k.single: obj})
 }
 
@@ -634,7 +669,8 @@ func (r *Registry) registerAll() {
 		title: "Get middleware",
 		description: "Get the full configuration of one HTTP or TCP middleware and the routers using it. " +
 			"Name like 'secHeaders@file'; a name without @provider is resolved when unique. " +
-			"Note: secrets such as basicAuth users are returned as Traefik exposes them.",
+			"Password hashes of basicAuth/digestAuth users are redacted unless the operator enabled SHOW_SECRETS; " +
+			"other plugin or header settings are returned as Traefik exposes them.",
 		enums: map[string][]any{"instance": instEnum, "protocol": noUDP},
 	}, func(ctx context.Context, in GetInput) (*mcp.CallToolResult, error) {
 		return r.get(ctx, kMiddlewares, in)
