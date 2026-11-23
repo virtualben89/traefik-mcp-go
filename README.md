@@ -75,7 +75,9 @@ TRAEFIK_LAN_URL=http://192.168.1.10:8080
 TRAEFIK_LAN_BEARER_TOKEN=...
 ```
 
-Every `*_PASSWORD`, `*_BEARER_TOKEN` and `*_HEADERS` variable also has a `_FILE` variant.
+Every `*_PASSWORD`, `*_BEARER_TOKEN` and `*_HEADERS` variable also has a `_FILE` variant. Credentials in the URL (`https://user:pass@host`) are rejected; use `*_BASIC_USER`/`*_BASIC_PASSWORD`.
+
+Boolean variables accept `true`/`false` (also `1`/`0`); any other value (e.g. `off`) stops the server with an error instead of silently using the default.
 
 ### MCP server
 
@@ -87,13 +89,15 @@ Every `*_PASSWORD`, `*_BEARER_TOKEN` and `*_HEADERS` variable also has a `_FILE`
 | `MCP_HTTP_ENABLE_SSE` | `true` | Also serve legacy SSE on `/sse` |
 | `MCP_HTTP_STATELESS` | `false` | Stateless Streamable HTTP (no session ID) |
 | `MCP_HTTP_JSON_RESPONSE` | `false` | `application/json` instead of SSE streams |
-| `MCP_HTTP_SESSION_TIMEOUT` | `30m` | Idle session timeout |
+| `MCP_HTTP_SESSION_TIMEOUT` | `30m` | Idle session timeout (`0` disables) |
 | `MCP_AUTH_TOKEN` / `MCP_AUTH_TOKEN_FILE` | – | Bearer token(s), comma separated, at least 16 characters. **Required for http** |
-| `MCP_ALLOW_NO_AUTH` | `false` | Explicitly allow http without a token |
+| `MCP_ALLOW_NO_AUTH` | `false` | Explicitly allow http without a token. Then only `Host` headers `localhost`/loopback and `MCP_ALLOWED_HOSTS` are accepted (DNS-rebinding protection) |
+| `MCP_ALLOWED_HOSTS` | – | Extra `Host` names (comma separated, port ignored) accepted by `/mcp` and `/sse`, e.g. `traefik-mcp,mcp.example.com`. Required for non-local access without a token; optional extra check with a token |
 | `TOOL_PREFIX` | – | Prefix for tool names, e.g. `traefik_` |
 | `DEFAULT_PER_PAGE` | `100` | Default page size |
 | `CERT_WARN_DAYS` | `21` | `health_report` warns about certificates expiring within this many days |
-| `TLS_CHECK_ENABLED` | `true` | Expose `check_tls_endpoint` (set `false` if the server must not open connections to arbitrary hosts) |
+| `TLS_CHECK_ENABLED` | `true` | Expose `check_tls_endpoint` (`false` removes the tool) |
+| `TLS_CHECK_ALLOW_CIDRS` | – | Internal ranges `check_tls_endpoint` may connect to, e.g. `192.168.100.0/24,10.0.0.5`. By default loopback, private (RFC 1918, ULA), link-local/metadata, CGNAT and other reserved addresses are refused |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / `text` | Logs always go to stderr |
 
 HTTP endpoints: `/mcp` and `/sse` (protected), `/healthz` (liveness), `/readyz` (503 if any instance is unreachable; only reports instance names).
@@ -156,7 +160,10 @@ publish the API through a router on `api@internal` protected by Basic Auth, Forw
 ## Security
 
 - The Traefik API is read-only by design; this server exposes no write operations.
-- `check_tls_endpoint` is the only tool that connects somewhere other than the configured Traefik APIs (a TLS handshake, no HTTP request). Disable it with `TLS_CHECK_ENABLED=false` if needed.
+- `check_tls_endpoint` is the only tool that connects somewhere other than the configured Traefik APIs (a TLS handshake, no HTTP request). It refuses internal addresses (checked after DNS resolution) unless they are listed in `TLS_CHECK_ALLOW_CIDRS`; disable it completely with `TLS_CHECK_ENABLED=false`.
+- The upstream client never follows redirects, so credentials only reach the configured Traefik URL.
+- Browser cross-origin requests to `/mcp` and `/sse` are rejected (`Sec-Fetch-Site`/`Origin`). Without a token the `Host` header must be loopback or in `MCP_ALLOWED_HOSTS`.
+- A failing tool call returns an error result; panics are caught and never stop the server. Pagination is limited to `per_page` ≤ 500 and `page` ≤ 1,000,000; rules longer than 64 KiB or nested deeper than 100 levels are reported as unparseable.
 - `get_middleware` returns middleware configuration as Traefik exposes it. That can include Basic Auth user hashes.
 - Bearer tokens are compared in constant time (SHA-256 digests). Without `MCP_AUTH_TOKEN` the HTTP transport refuses to start unless `MCP_ALLOW_NO_AUTH=true`.
 - The container runs as UID 65532 on `scratch` (no shell).

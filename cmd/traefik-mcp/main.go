@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -110,9 +111,20 @@ func buildInstances(cfg *config.Config) (map[string]tools.Instance, error) {
 		if err != nil {
 			return nil, fmt.Errorf("instance %s: %w", in.Name, err)
 		}
-		out[in.Name] = tools.Instance{Client: c, URL: c.BaseURL(), Auth: in.AuthMode()}
+		out[in.Name] = tools.Instance{Client: c, URL: redactURL(c.BaseURL()), Auth: in.AuthMode()}
 	}
 	return out, nil
+}
+
+// redactURL drops userinfo so upstream credentials never reach tool output
+// (config already rejects it; this is defence in depth).
+func redactURL(s string) string {
+	u, err := url.Parse(s)
+	if err != nil {
+		return "(invalid URL)"
+	}
+	u.User = nil
+	return u.String()
 }
 
 func run() error {
@@ -128,12 +140,13 @@ func run() error {
 		return err
 	}
 	toolOpts := tools.Options{
-		Prefix:          cfg.ToolPrefix,
-		DefaultPerPage:  cfg.DefaultPerPage,
-		Default:         cfg.DefaultInstance,
-		Order:           cfg.InstanceNames(),
-		CertWarnDays:    cfg.CertWarnDays,
-		DisableTLSCheck: !cfg.TLSCheckEnabled,
+		Prefix:             cfg.ToolPrefix,
+		DefaultPerPage:     cfg.DefaultPerPage,
+		Default:            cfg.DefaultInstance,
+		Order:              cfg.InstanceNames(),
+		CertWarnDays:       cfg.CertWarnDays,
+		DisableTLSCheck:    !cfg.TLSCheckEnabled,
+		TLSCheckAllowCIDRs: cfg.TLSCheckAllowCIDRs,
 	}
 	server, names := NewServer(instances, toolOpts, log)
 	log.Info("traefik-mcp starting", "version", version, "transport", cfg.Transport,
@@ -231,7 +244,8 @@ func bearerVerifier(tokens []string) auth.TokenVerifier {
 
 func serveHTTP(ctx context.Context, cfg *config.Config, server *mcp.Server, instances map[string]tools.Instance, log *slog.Logger) error {
 	if len(cfg.AuthTokens) == 0 {
-		log.Warn("HTTP transport running WITHOUT authentication (MCP_ALLOW_NO_AUTH=true)")
+		log.Warn("HTTP transport running WITHOUT authentication (MCP_ALLOW_NO_AUTH=true); only Host headers localhost/loopback and MCP_ALLOWED_HOSTS are accepted",
+			"addr", cfg.HTTPAddr, "allowed_hosts", strings.Join(cfg.AllowedHosts, ","))
 	}
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -259,24 +273,38 @@ func serveHTTP(ctx context.Context, cfg *config.Config, server *mcp.Server, inst
 func buildHandler(cfg *config.Config, server *mcp.Server, instances map[string]tools.Instance, log *slog.Logger) http.Handler {
 	getServer := func(*http.Request) *mcp.Server { return server }
 
-	protect := func(h http.Handler) http.Handler { return h }
+	// Browsers: reject cross-origin requests (Sec-Fetch-Site / Origin checks).
+	// Non-browser MCP clients send neither header and are unaffected.
+	cop := http.NewCrossOriginProtection()
+	hostGuard := func(h http.Handler) http.Handler { return h }
+	// Without bearer auth the Host header is the only defence against DNS
+	// rebinding, so it is always checked; with auth only when configured.
+	// Our check replaces the SDK's, which only applies on loopback listeners
+	// and would reject MCP_ALLOWED_HOSTS there.
+	ownHostCheck := len(cfg.AuthTokens) == 0 || len(cfg.AllowedHosts) > 0
+	if ownHostCheck {
+		hostGuard = func(h http.Handler) http.Handler { return requireHost(cfg.AllowedHosts, h) }
+	}
+	protect := func(h http.Handler) http.Handler { return hostGuard(cop.Handler(h)) }
 	if len(cfg.AuthTokens) > 0 {
-		protect = auth.RequireBearerToken(bearerVerifier(cfg.AuthTokens), &auth.RequireBearerTokenOptions{})
+		bearer := auth.RequireBearerToken(bearerVerifier(cfg.AuthTokens), &auth.RequireBearerTokenOptions{})
+		protect = func(h http.Handler) http.Handler { return hostGuard(cop.Handler(bearer(h))) }
 	}
 
 	mux := http.NewServeMux()
 	streamable := mcp.NewStreamableHTTPHandler(getServer, &mcp.StreamableHTTPOptions{
-		Stateless:      cfg.HTTPStateless,
-		JSONResponse:   cfg.HTTPJSONResponse,
-		SessionTimeout: cfg.HTTPSessionTimeout,
-		Logger:         log,
+		Stateless:                  cfg.HTTPStateless,
+		JSONResponse:               cfg.HTTPJSONResponse,
+		SessionTimeout:             cfg.HTTPSessionTimeout,
+		Logger:                     log,
+		DisableLocalhostProtection: ownHostCheck,
 	})
 	mux.Handle(cfg.HTTPPath, protect(streamable))
 	if !strings.HasSuffix(cfg.HTTPPath, "/") {
 		mux.Handle(cfg.HTTPPath+"/", protect(streamable))
 	}
 	if cfg.HTTPEnableSSE {
-		sse := mcp.NewSSEHandler(getServer, nil)
+		sse := mcp.NewSSEHandler(getServer, &mcp.SSEOptions{DisableLocalhostProtection: ownHostCheck})
 		mux.Handle("/sse", protect(sse))
 		mux.Handle("/sse/", protect(sse))
 	}
@@ -304,6 +332,28 @@ func buildHandler(cfg *config.Config, server *mcp.Server, instances map[string]t
 	})
 
 	return logRequests(log, mux)
+}
+
+// requireHost only lets requests through whose Host header is a loopback
+// name/address or listed in allowed (independent of the accepting interface).
+func requireHost(allowed []string, next http.Handler) http.Handler {
+	ok := map[string]bool{"localhost": true}
+	for _, h := range allowed {
+		ok[h] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := strings.ToLower(r.Host)
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		host = strings.TrimSuffix(strings.Trim(host, "[]"), ".")
+		ip := net.ParseIP(host)
+		if !ok[host] && (ip == nil || !ip.IsLoopback()) && !strings.HasSuffix(host, ".localhost") {
+			http.Error(w, fmt.Sprintf("Forbidden: Host %q not allowed (set MCP_ALLOWED_HOSTS)", r.Host), http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 type statusWriter struct {

@@ -105,7 +105,13 @@ func New(o Options) (*Client, error) {
 	return &Client{
 		name: o.Name,
 		base: strings.TrimSuffix(strings.TrimRight(o.BaseURL, "/"), "/api") + "/api",
-		http: &http.Client{Timeout: o.Timeout, Transport: tr},
+		http: &http.Client{
+			Timeout:   o.Timeout,
+			Transport: tr,
+			// Never follow redirects: credentials (Authorization and custom headers)
+			// must only ever reach the configured origin.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
 		opts: o,
 	}, nil
 }
@@ -153,6 +159,10 @@ func (c *Client) Get(ctx context.Context, path string, query url.Values) (*Respo
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("traefik[%s]: reading response: %w", c.name, err)
+	}
+	if resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+		return nil, &APIError{Instance: c.name, Path: path, Status: resp.StatusCode,
+			Body: "redirect not followed (credentials are only sent to the configured URL); point the instance URL at the final API address"}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, &APIError{Instance: c.name, Path: path, Status: resp.StatusCode, Body: string(data)}

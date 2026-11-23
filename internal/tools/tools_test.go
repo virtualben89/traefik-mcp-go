@@ -214,6 +214,29 @@ func TestListRoutersPagingAndSlim(t *testing.T) {
 	}
 }
 
+// Regression: huge pagination values must be rejected, not crash the server
+// (local pagination is used when service/middleware filters are set).
+func TestListPaginationBounds(t *testing.T) {
+	cs := setup(t)
+	for _, args := range []map[string]any{
+		{"service": "app", "page": 3, "per_page": 4611686018427387904},
+		{"service": "app", "page": 4611686018427387904, "per_page": 2},
+		{"per_page": 501},
+		{"page": 1000001},
+		{"middleware": "x", "per_page": -1},
+	} {
+		if txt, isErr := call(t, cs, "list_routers", args); !isErr {
+			t.Errorf("%v must be rejected: %s", args, txt)
+		}
+	}
+	if txt, isErr := call(t, cs, "list_routers", map[string]any{"service": "svc", "page": 1000000, "per_page": 500}); isErr || !strings.Contains(txt, `"count":0`) {
+		t.Errorf("max bounds: %s", txt)
+	}
+	if txt, isErr := call(t, cs, "list_routers", nil); isErr {
+		t.Fatalf("server must still be alive: %s", txt)
+	}
+}
+
 func TestGetRouterResolution(t *testing.T) {
 	cs := setup(t)
 	for _, tc := range []struct {

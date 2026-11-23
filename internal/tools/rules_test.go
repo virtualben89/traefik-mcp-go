@@ -1,6 +1,9 @@
 package tools
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRuleEvalHTTP(t *testing.T) {
 	req := requestInfo{host: "app.example.com", path: "/api/v1/items", method: "GET"}
@@ -76,6 +79,34 @@ func TestRuleParseErrors(t *testing.T) {
 	n, _ := parseRule("Host(`a`) && (Header(`X`, `1`) || Query(`q`, `1`))")
 	if u := n.unknownMatchers(false); len(u) != 2 {
 		t.Errorf("unknown matchers: %v", u)
+	}
+}
+
+// Regression: upstream rules must not be able to exhaust the stack.
+func TestRuleLimits(t *testing.T) {
+	deep := strings.Repeat("!", 1000) + "Host(`a`)"
+	if _, err := parseRule(deep); err == nil || !strings.Contains(err.Error(), "nested") {
+		t.Errorf("deep !: %v", err)
+	}
+	parens := strings.Repeat("(", 500) + "Host(`a`)" + strings.Repeat(")", 500)
+	if _, err := parseRule(parens); err == nil {
+		t.Error("deep parentheses must fail")
+	}
+	if _, err := parseRule(strings.Repeat("!", 50) + "Host(`a`)"); err != nil {
+		t.Errorf("moderate nesting must work: %v", err)
+	}
+	long := "Host(`" + strings.Repeat("a", maxRuleLen) + "`)"
+	if _, err := parseRule(long); err == nil || !strings.Contains(err.Error(), "longer") {
+		t.Errorf("long rule: %v", err)
+	}
+	// A long && chain within the length limit parses and evaluates.
+	chain := strings.TrimSuffix(strings.Repeat("Host(`a`) && ", 4000), " && ")
+	n, err := parseRule(chain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := n.evalHTTP(requestInfo{host: "a", path: "/", method: "GET"}); got != triYes {
+		t.Errorf("chain eval: %s", got)
 	}
 }
 

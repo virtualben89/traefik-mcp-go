@@ -109,9 +109,25 @@ func tokenizeRule(s string) ([]ruleToken, error) {
 	return out, nil
 }
 
+// Limits for upstream-controlled rule strings: the parser and the evaluators
+// recurse, and a Go stack overflow is fatal (cannot be recovered).
+const (
+	maxRuleLen   = 64 << 10 // bytes
+	maxRuleDepth = 100      // nesting of ! and ( )
+)
+
 type ruleParser struct {
-	toks []ruleToken
-	pos  int
+	toks  []ruleToken
+	pos   int
+	depth int
+}
+
+func (p *ruleParser) enter() error {
+	p.depth++
+	if p.depth > maxRuleDepth {
+		return fmt.Errorf("rule nested deeper than %d levels", maxRuleDepth)
+	}
+	return nil
 }
 
 func (p *ruleParser) peek() string {
@@ -157,6 +173,10 @@ func (p *ruleParser) unary() (*ruleNode, error) {
 	switch p.peek() {
 	case "!":
 		p.pos++
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer func() { p.depth-- }()
 		n, err := p.unary()
 		if err != nil {
 			return nil, err
@@ -164,6 +184,10 @@ func (p *ruleParser) unary() (*ruleNode, error) {
 		return &ruleNode{op: "!", children: []*ruleNode{n}}, nil
 	case "(":
 		p.pos++
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer func() { p.depth-- }()
 		n, err := p.or()
 		if err != nil {
 			return nil, err
@@ -198,6 +222,9 @@ func (p *ruleParser) unary() (*ruleNode, error) {
 }
 
 func parseRule(rule string) (*ruleNode, error) {
+	if len(rule) > maxRuleLen {
+		return nil, fmt.Errorf("rule longer than %d bytes", maxRuleLen)
+	}
 	toks, err := tokenizeRule(rule)
 	if err != nil {
 		return nil, err

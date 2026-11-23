@@ -11,8 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -40,7 +42,9 @@ func (r *Registry) checkTLS(ctx context.Context, in CheckTLSInput) (*mcp.CallToo
 	if h, p, err := net.SplitHostPort(host); err == nil {
 		host = h
 		if port == 0 {
-			port, _ = strconv.Atoi(p)
+			if port, err = strconv.Atoi(p); err != nil {
+				return nil, fmt.Errorf("invalid port %q in host", p)
+			}
 		}
 	}
 	host = strings.Trim(host, "[]")
@@ -59,7 +63,7 @@ func (r *Registry) checkTLS(ctx context.Context, in CheckTLSInput) (*mcp.CallToo
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	d := &tls.Dialer{
-		NetDialer: &net.Dialer{},
+		NetDialer: &net.Dialer{Control: r.dialControl},
 		Config: &tls.Config{
 			ServerName:         sni,
 			InsecureSkipVerify: true, //nolint:gosec // we verify manually below to report details
@@ -103,8 +107,11 @@ func (r *Registry) checkTLS(ctx context.Context, in CheckTLSInput) (*mcp.CallToo
 		inter.AddCert(c)
 	}
 	opts := x509.VerifyOptions{Roots: rootCAs, Intermediates: inter, CurrentTime: now}
-	if sni != "" {
-		opts.DNSName = sni
+	// Verify against the SNI, or for IP targets without SNI against the IP
+	// itself (checked against the certificate's IP SANs).
+	opts.DNSName = sni
+	if opts.DNSName == "" {
+		opts.DNSName = host
 	}
 	verified, verifyErr := true, ""
 	if _, err := leaf.Verify(opts); err != nil {
@@ -143,8 +150,10 @@ func (r *Registry) checkTLS(ctx context.Context, in CheckTLSInput) (*mcp.CallToo
 		if err != nil || !ok {
 			return nil
 		}
+		// Only the exact certificate counts; serial numbers are public and only
+		// unique per issuer.
 		for _, c := range certs {
-			if strings.EqualFold(c.CertFingerprint, fingerprint) || (c.SerialNumber != "" && c.SerialNumber == leaf.SerialNumber.String()) {
+			if c.CertFingerprint != "" && normFingerprint(c.CertFingerprint) == fingerprint {
 				return true
 			}
 		}
@@ -160,6 +169,54 @@ func (r *Registry) checkTLS(ctx context.Context, in CheckTLSInput) (*mcp.CallToo
 		out["in_traefik_store"] = stores
 	}
 	return valueResult(out)
+}
+
+func normFingerprint(s string) string {
+	return strings.ToLower(strings.NewReplacer(":", "", " ", "").Replace(s))
+}
+
+// blockedPrefixes are destinations check_tls_endpoint refuses unless the
+// operator allows them via TLS_CHECK_ALLOW_CIDRS.
+var blockedPrefixes = func() []netip.Prefix {
+	var out []netip.Prefix
+	for _, s := range []string{
+		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+		"192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/3",
+		"::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8", "64:ff9b:1::/48",
+	} {
+		out = append(out, netip.MustParsePrefix(s))
+	}
+	return out
+}()
+
+// destinationAllowed reports whether check_tls_endpoint may connect to ip.
+func destinationAllowed(ip netip.Addr, allow []netip.Prefix) bool {
+	ip = ip.Unmap()
+	for _, p := range allow {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	for _, p := range blockedPrefixes {
+		if p.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+// dialControl runs after DNS resolution, for every address actually dialed,
+// so DNS names resolving to internal addresses are caught as well.
+func (r *Registry) dialControl(_, address string, _ syscall.RawConn) error {
+	ap, err := netip.ParseAddrPort(address)
+	if err != nil {
+		return fmt.Errorf("unexpected dial address %q", address)
+	}
+	if !destinationAllowed(ap.Addr(), r.opts.TLSCheckAllowCIDRs) {
+		return fmt.Errorf("destination %s is an internal address (loopback, private, link-local, CGNAT, ...) and blocked by default; "+
+			"the operator can allow it via TLS_CHECK_ALLOW_CIDRS", ap.Addr().Unmap())
+	}
+	return nil
 }
 
 func certNames(c *x509.Certificate) []string {
